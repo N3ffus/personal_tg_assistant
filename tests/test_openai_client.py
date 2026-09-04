@@ -39,6 +39,7 @@ async def test_parse_message_validates_json_chat_completion() -> None:
 
     assert decision.action.type is ActionType.CREATE_TASK
     assert decision.action.title == "Купить продукты"
+    assert create.await_args is not None
     assert create.await_args.kwargs["response_format"] == {"type": "json_object"}
 
 

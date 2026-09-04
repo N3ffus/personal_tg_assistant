@@ -38,6 +38,11 @@ class GonkaGateLLMClient:
             '"title":"Купить продукты"}}\n'
             'Пример create_event: {"action":{"type":"create_event",'
             '"title":"Стоматолог","starts_at":"2026-08-13T15:00:00+03:00"}}\n'
+            'Пример list_events: {"action":{"type":"list_events"}}\n'
+            'Пример update_event: {"action":{"type":"update_event",'
+            '"title":"Стоматолог","starts_at":"2026-08-14T16:00:00+03:00"}}\n'
+            'Пример delete_event: {"action":{"type":"delete_event",'
+            '"title":"Стоматолог"}}\n'
             'Пример save_note: {"action":{"type":"save_note",'
             '"text":"Люблю Python"}}\n'
             f"Текущее время: {now.isoformat()}\n"

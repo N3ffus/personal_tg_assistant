@@ -6,9 +6,11 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
+from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
 from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
 )
+from src.infrastructure.telegram.replies import answer_text
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ def create_router(
     *,
     process_message: ProcessMessageUseCase,
     timezone: str,
+    allowed_user_id: int,
 ) -> Router:
     router = Router(
         name=__name__,
@@ -26,6 +29,9 @@ def create_router(
     async def start_handler(
         message: Message,
     ) -> None:
+        if message.from_user is None or message.from_user.id != allowed_user_id:
+            return
+
         await message.answer(
             "Привет! Я ИИ-помощник.\n\n"
             "Можешь написать, например:\n"
@@ -43,6 +49,12 @@ def create_router(
         if not text:
             return
 
+        if message.from_user is None:
+            return
+
+        if message.from_user.id != allowed_user_id:
+            return
+
         try:
             now = datetime.now(
                 ZoneInfo(timezone),
@@ -52,7 +64,29 @@ def create_router(
                 text=text,
                 now=now,
                 timezone=timezone,
+                user_id=message.from_user.id,
             )
+
+        except TaskCreationUncertainError:
+            logger.exception(
+                "Linear task creation result is uncertain",
+            )
+
+            await message.answer(
+                "Linear мог успеть создать задачу. "
+                "Проверьте список задач перед повтором."
+            )
+            return
+
+        except TaskTrackerError:
+            logger.exception(
+                "Failed to create Linear task",
+            )
+
+            await message.answer(
+                "Не удалось создать задачу в Linear. Попробуйте позже."
+            )
+            return
 
         except Exception:
             logger.exception(
@@ -62,6 +96,6 @@ def create_router(
             await message.answer("Не получилось обработать сообщение.")
             return
 
-        await message.answer(response)
+        await answer_text(message, response)
 
     return router

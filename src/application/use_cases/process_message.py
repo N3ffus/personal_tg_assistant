@@ -22,6 +22,7 @@ class ProcessMessageUseCase:
         text: str,
         now: datetime,
         timezone: str,
+        user_id: int,
     ) -> str:
         decision = await self._llm.parse_message(
             text=text,
@@ -31,4 +32,6 @@ class ProcessMessageUseCase:
 
         return await self._action_executor.execute(
             decision.action,
+            user_id=user_id,
+            now=now,
         )

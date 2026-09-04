@@ -30,7 +30,11 @@ RUN useradd --create-home --uid 10001 app
 
 WORKDIR /app
 
+EXPOSE 8080
+
 COPY --from=builder --chown=app:app /app /app
+
+RUN mkdir -p /app/data && chown app:app /app/data
 
 USER app
 

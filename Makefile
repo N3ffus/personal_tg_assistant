@@ -11,6 +11,7 @@ run:
 	$(UV) run python -m src.main
 
 lint:
+	$(UV) run ruff format --check .
 	$(UV) run ruff check .
 
 format:
@@ -18,10 +19,10 @@ format:
 	$(UV) run ruff check . --fix
 
 typecheck:
-	$(UV) run mypy src
+	$(UV) run mypy src tests
 
 test:
-	$(UV) run pytest
+	$(UV) run pytest --cov=src --cov-branch --cov-report=term-missing
 
 check: lint typecheck test
 
@@ -29,7 +30,7 @@ docker-build:
 	docker build --tag $(IMAGE_NAME) .
 
 docker-run: docker-build docker-remove
-	docker run --detach --name $(CONTAINER_NAME) --env-file .env --restart unless-stopped $(IMAGE_NAME)
+	docker run --detach --name $(CONTAINER_NAME) --env-file .env --publish 8080:8080 --mount type=volume,source=$(CONTAINER_NAME)-data,target=/app/data --restart unless-stopped $(IMAGE_NAME)
 
 docker-remove:
 	-docker rm --force $(CONTAINER_NAME)

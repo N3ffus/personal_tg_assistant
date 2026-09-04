@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.domain.assistant.enums import ActionType
 
@@ -28,12 +28,36 @@ class CreateEventAction(DomainModel):
     starts_at: datetime
 
 
+class ListEventsAction(DomainModel):
+    type: Literal[ActionType.LIST_EVENTS]
+
+
+class UpdateEventAction(DomainModel):
+    type: Literal[ActionType.UPDATE_EVENT]
+    title: str
+    starts_at: datetime
+
+
+class DeleteEventAction(DomainModel):
+    type: Literal[ActionType.DELETE_EVENT]
+    title: str
+
+
 class SaveNoteAction(DomainModel):
     type: Literal[ActionType.SAVE_NOTE]
     text: str
 
 
-AssistantAction = ChatAction | CreateTaskAction | CreateEventAction | SaveNoteAction
+AssistantAction = Annotated[
+    ChatAction
+    | CreateTaskAction
+    | CreateEventAction
+    | ListEventsAction
+    | UpdateEventAction
+    | DeleteEventAction
+    | SaveNoteAction,
+    Field(discriminator="type"),
+]
 
 
 class AssistantDecision(DomainModel):

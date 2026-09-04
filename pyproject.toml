@@ -5,11 +5,18 @@ description = "Telegram ai assistent that helps remember stuff and create tasks"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiosqlite>=0.22.1",
     "aiogram>=3.30.0",
+    "cryptography>=46.0.5",
+    "fastapi>=0.128.0",
+    "google-api-python-client>=2.190.0",
+    "google-auth-oauthlib>=1.3.0",
+    "httpx>=0.28.1",
     "openai>=3.0.0",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
     "tzdata>=2025.2",
+    "uvicorn>=0.40.0",
 ]
 
 [dependency-groups]
@@ -17,6 +24,7 @@ dev = [
     "mypy>=2.3.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.0.0",
     "ruff>=0.16.2",
 ]
 
@@ -41,8 +49,21 @@ select = [
     "UP",
     "B",
 ]
+ignore = ["E501"]
 
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["googleapiclient.*", "google_auth_oauthlib.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

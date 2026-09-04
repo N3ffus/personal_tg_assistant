@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+import uvicorn
 from aiogram import Bot, Dispatcher
 
 from src.application.services.action_executor import (
@@ -10,12 +11,50 @@ from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
 )
 from src.config import Settings
+from src.infrastructure.calendar.google import GoogleCalendarClient
+from src.infrastructure.calendar.oauth import GoogleOAuthService, create_oauth_app
+from src.infrastructure.calendar.storage import CalendarStorage
 from src.infrastructure.llm.gonkagate import (
     GonkaGateLLMClient,
 )
+from src.infrastructure.tasks.linear import LinearTaskClient
+from src.infrastructure.telegram.business import create_business_router
+from src.infrastructure.telegram.calendar import create_calendar_router
 from src.infrastructure.telegram.handlers import (
     create_router,
 )
+
+POLLING_CONCURRENCY_LIMIT = 32
+
+
+async def _run_services(
+    *, dispatcher: Dispatcher, bot: Bot, server: uvicorn.Server
+) -> None:
+    polling = asyncio.create_task(
+        dispatcher.start_polling(
+            bot,
+            handle_signals=False,
+            close_bot_session=False,
+            tasks_concurrency_limit=POLLING_CONCURRENCY_LIMIT,
+        ),
+        name="telegram-polling",
+    )
+    serving = asyncio.create_task(server.serve(), name="oauth-http-server")
+    services = {polling, serving}
+
+    try:
+        done, _ = await asyncio.wait(
+            services,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
+    finally:
+        server.should_exit = True
+        for task in services:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*services, return_exceptions=True)
 
 
 async def main() -> None:
@@ -26,32 +65,84 @@ async def main() -> None:
         base_url=settings.llm_base_url,
         model=settings.llm_model,
     )
-
-    action_executor = ActionExecutor()
-
-    process_message = ProcessMessageUseCase(
-        llm=llm,
-        action_executor=action_executor,
-    )
-
-    router = create_router(
-        process_message=process_message,
-        timezone=settings.app_timezone,
-    )
-
-    dispatcher = Dispatcher()
-    dispatcher.include_router(router)
-
-    bot = Bot(
-        token=settings.telegram_bot_token.get_secret_value(),
-    )
-
+    task_tracker: LinearTaskClient | None = None
+    bot: Bot | None = None
     try:
-        await dispatcher.start_polling(bot)
+        storage = CalendarStorage(
+            database_path=settings.database_path,
+            encryption_key=settings.google_token_encryption_key.get_secret_value(),
+        )
+        await storage.initialize()
+        calendar = GoogleCalendarClient(storage=storage)
+        oauth = GoogleOAuthService(
+            storage=storage,
+            client_id=settings.google_oauth_client_id,
+            client_secret=settings.google_oauth_client_secret.get_secret_value(),
+            redirect_uri=settings.google_oauth_redirect_uri,
+        )
+        task_tracker = LinearTaskClient(
+            api_key=settings.linear_api_key.get_secret_value(),
+            team_id=settings.linear_team_id,
+        )
 
+        action_executor = ActionExecutor(
+            calendar=calendar,
+            pending_operations=storage,
+            task_tracker=task_tracker,
+        )
+
+        process_message = ProcessMessageUseCase(
+            llm=llm,
+            action_executor=action_executor,
+        )
+
+        dispatcher = Dispatcher()
+        dispatcher.include_router(
+            create_business_router(
+                allowed_user_id=settings.telegram_allowed_user_id,
+            )
+        )
+        dispatcher.include_router(
+            create_calendar_router(
+                timezone=settings.app_timezone,
+                allowed_user_id=settings.telegram_allowed_user_id,
+                calendar=calendar,
+                oauth=oauth,
+                storage=storage,
+            )
+        )
+        dispatcher.include_router(
+            create_router(
+                process_message=process_message,
+                timezone=settings.app_timezone,
+                allowed_user_id=settings.telegram_allowed_user_id,
+            )
+        )
+
+        bot = Bot(
+            token=settings.telegram_bot_token.get_secret_value(),
+        )
+
+        server = uvicorn.Server(
+            uvicorn.Config(
+                create_oauth_app(oauth=oauth),
+                host=settings.http_host,
+                port=settings.http_port,
+                log_level="info",
+                access_log=False,
+            )
+        )
+        await _run_services(dispatcher=dispatcher, bot=bot, server=server)
     finally:
-        await llm.close()
-        await bot.session.close()
+        try:
+            if task_tracker is not None:
+                await task_tracker.close()
+        finally:
+            try:
+                await llm.close()
+            finally:
+                if bot is not None:
+                    await bot.session.close()
 
 
 if __name__ == "__main__":
