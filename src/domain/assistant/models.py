@@ -61,4 +61,4 @@ AssistantAction = Annotated[
 
 
 class AssistantDecision(DomainModel):
-    action: AssistantAction
+    actions: list[AssistantAction] = Field(min_length=1, max_length=10)

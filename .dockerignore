@@ -17,6 +17,10 @@ __pycache__
 .ruff_cache
 
 .env
+.env.*
+AGENTS.md
+.deepeval*
+eval-results
 
 dist
 build

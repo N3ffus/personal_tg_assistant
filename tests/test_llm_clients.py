@@ -17,6 +17,18 @@ from src.infrastructure.llm.openai import OpenAILLMClient
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=timezone(timedelta(hours=3)))
 
 
+@pytest.mark.parametrize(
+    "actions",
+    [
+        [],
+        [{"type": "create_task", "title": f"Task {index}"} for index in range(11)],
+    ],
+)
+def test_assistant_decision_limits_batch_size(actions: list[object]) -> None:
+    with pytest.raises(ValidationError):
+        AssistantDecision.model_validate({"actions": actions})
+
+
 @pytest.mark.asyncio
 async def test_openai_client_requests_structured_decision_with_user_context() -> None:
     client = OpenAILLMClient(
@@ -25,7 +37,7 @@ async def test_openai_client_requests_structured_decision_with_user_context() ->
         model="test-model",
     )
     expected = AssistantDecision(
-        action=ChatAction(type=ActionType.CHAT, text="Привет!")
+        actions=[ChatAction(type=ActionType.CHAT, text="Привет!")]
     )
     parse = AsyncMock(return_value=SimpleNamespace(output_parsed=expected))
     client._client.responses.parse = parse  # type: ignore[method-assign]
@@ -48,6 +60,8 @@ async def test_openai_client_requests_structured_decision_with_user_context() ->
     assert "list_events" in kwargs["instructions"]
     assert "update_event" in kwargs["instructions"]
     assert "delete_event" in kwargs["instructions"]
+    assert "в массиве actions" in kwargs["instructions"]
+    assert "Поботать LLM-ки" in kwargs["instructions"]
 
 
 @pytest.mark.asyncio
@@ -95,7 +109,9 @@ async def test_gonkagate_client_includes_json_contract_and_user_context() -> Non
         return_value=SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content='{"action":{"type":"list_events"}}')
+                    message=SimpleNamespace(
+                        content='{"actions":[{"type":"list_events"}]}'
+                    )
                 )
             ]
         )
@@ -108,7 +124,7 @@ async def test_gonkagate_client_includes_json_contract_and_user_context() -> Non
         timezone="Europe/Moscow",
     )
 
-    assert decision.action.type is ActionType.LIST_EVENTS
+    assert decision.actions[0].type is ActionType.LIST_EVENTS
     assert create.await_args is not None
     kwargs = create.await_args.kwargs
     assert kwargs["model"] == "test-model"
@@ -121,6 +137,7 @@ async def test_gonkagate_client_includes_json_contract_and_user_context() -> Non
     assert "Timezone пользователя: Europe/Moscow" in instructions
     assert '"type":"update_event"' in instructions
     assert '"type":"delete_event"' in instructions
+    assert "Корневой объект всегда содержит массив actions" in instructions
     assert kwargs["response_format"] == {"type": "json_object"}
 
 
@@ -178,7 +195,7 @@ async def test_gonkagate_client_validates_action_schema() -> None:
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
-                        content='{"action":{"type":"create_event","title":"Meet"}}'
+                        content='{"actions":[{"type":"create_event","title":"Meet"}]}'
                     )
                 )
             ]

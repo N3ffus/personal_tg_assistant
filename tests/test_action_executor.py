@@ -1,9 +1,14 @@
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
+from src.application.ports.calendar import CalendarError, CalendarNotConnectedError
+from src.application.ports.tasks import (
+    TaskCreationUncertainError,
+    TaskTrackerError,
+)
 from src.application.services.action_executor import ActionExecutor
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
@@ -65,6 +70,144 @@ def dependencies(
         task_tracker=task_tracker,
     )
     return executor, calendar, pending, task_tracker
+
+
+@pytest.mark.asyncio
+async def test_execute_many_creates_all_tasks_in_source_order() -> None:
+    executor, calendar, pending, task_tracker = dependencies()
+    task_tracker.create_task.side_effect = [
+        CreatedTask(identifier="ENG-1", title="Посмотреть фильм", url="url-1"),
+        CreatedTask(identifier="ENG-2", title="Поботать LLM-ки", url="url-2"),
+        CreatedTask(identifier="ENG-3", title="Отдохнуть", url="url-3"),
+    ]
+    actions = [
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Посмотреть фильм"),
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Поботать LLM-ки"),
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Отдохнуть"),
+    ]
+
+    result = await executor.execute_many(actions, user_id=42, now=NOW)
+
+    assert task_tracker.create_task.await_args_list == [
+        call(title="Посмотреть фильм"),
+        call(title="Поботать LLM-ки"),
+        call(title="Отдохнуть"),
+    ]
+    calendar.create_event.assert_not_awaited()
+    pending.consume_latest_operation.assert_not_awaited()
+    assert result == (
+        "✅ Создана задача ENG-1: Посмотреть фильм\nurl-1\n\n"
+        "✅ Создана задача ENG-2: Поботать LLM-ки\nurl-2\n\n"
+        "✅ Создана задача ENG-3: Отдохнуть\nurl-3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_many_supports_mixed_task_and_calendar_event() -> None:
+    executor, calendar, _, task_tracker = dependencies()
+    task_tracker.create_task.return_value = CreatedTask(
+        identifier="ENG-1",
+        title="Купить молоко",
+        url="task-url",
+    )
+    actions: list[AssistantAction] = [
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Купить молоко"),
+        CreateEventAction(
+            type=ActionType.CREATE_EVENT,
+            title="Стоматолог",
+            starts_at=EVENT_START,
+        ),
+    ]
+
+    result = await executor.execute_many(actions, user_id=42, now=NOW)
+
+    task_tracker.create_task.assert_awaited_once_with(title="Купить молоко")
+    calendar.create_event.assert_awaited_once_with(
+        user_id=42,
+        title="Стоматолог",
+        starts_at=EVENT_START,
+    )
+    assert result == (
+        "✅ Создана задача ENG-1: Купить молоко\ntask-url\n\n"
+        "✅ Создано событие: Стоматолог\n"
+        "Время: 04.09.2026 15:30\n"
+        "https://calendar.test/event-1"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            TaskCreationUncertainError(),
+            "⚠️ Linear мог создать задачу «Первая». "
+            "Проверьте список задач перед повтором.",
+        ),
+        (
+            TaskTrackerError(),
+            "❌ Не удалось создать задачу «Первая» в Linear.",
+        ),
+    ],
+)
+async def test_execute_many_reports_task_failure_and_continues(
+    error: TaskTrackerError,
+    expected: str,
+) -> None:
+    executor, _, _, task_tracker = dependencies()
+    task_tracker.create_task.side_effect = [
+        error,
+        CreatedTask(identifier="ENG-2", title="Вторая", url="url-2"),
+    ]
+    actions = [
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Первая"),
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Вторая"),
+    ]
+
+    result = await executor.execute_many(actions, user_id=42, now=NOW)
+
+    assert result == f"{expected}\n\n✅ Создана задача ENG-2: Вторая\nurl-2"
+    assert task_tracker.create_task.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            CalendarNotConnectedError(),
+            "❌ Не удалось создать событие «Стоматолог»: подключите календарь "
+            "командой /calendar_connect.",
+        ),
+        (
+            CalendarError(),
+            "❌ Не удалось создать событие «Стоматолог»: календарь недоступен.",
+        ),
+    ],
+)
+async def test_execute_many_reports_calendar_failure(
+    error: CalendarError,
+    expected: str,
+) -> None:
+    executor, calendar, _, _ = dependencies()
+    calendar.create_event.side_effect = error
+    action = CreateEventAction(
+        type=ActionType.CREATE_EVENT,
+        title="Стоматолог",
+        starts_at=EVENT_START,
+    )
+
+    result = await executor.execute_many([action], user_id=42, now=NOW)
+
+    assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_execute_many_rejects_empty_batch() -> None:
+    executor, _, _, _ = dependencies()
+
+    with pytest.raises(ValueError, match="At least one action"):
+        await executor.execute_many([], user_id=42, now=NOW)
 
 
 @pytest.mark.asyncio

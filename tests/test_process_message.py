@@ -6,7 +6,12 @@ import pytest
 
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.enums import ActionType
-from src.domain.assistant.models import AssistantDecision, ChatAction
+from src.domain.assistant.models import (
+    AssistantAction,
+    AssistantDecision,
+    ChatAction,
+    CreateTaskAction,
+)
 
 
 @pytest.mark.asyncio
@@ -14,9 +19,9 @@ async def test_process_message_parses_then_executes_decision() -> None:
     now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
     action = ChatAction(type=ActionType.CHAT, text="Ответ")
     llm = SimpleNamespace(
-        parse_message=AsyncMock(return_value=AssistantDecision(action=action))
+        parse_message=AsyncMock(return_value=AssistantDecision(actions=[action]))
     )
-    action_executor = SimpleNamespace(execute=AsyncMock(return_value="Ответ"))
+    action_executor = SimpleNamespace(execute_many=AsyncMock(return_value="Ответ"))
     use_case = ProcessMessageUseCase(
         llm=llm,
         action_executor=action_executor,  # type: ignore[arg-type]
@@ -35,8 +40,42 @@ async def test_process_message_parses_then_executes_decision() -> None:
         now=now,
         timezone="Europe/Moscow",
     )
-    action_executor.execute.assert_awaited_once_with(
-        action,
+    action_executor.execute_many.assert_awaited_once_with(
+        [action],
+        user_id=42,
+        now=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_message_passes_all_actions_to_executor() -> None:
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+    actions: list[AssistantAction] = [
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Посмотреть фильм"),
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Поботать LLM-ки"),
+        CreateTaskAction(type=ActionType.CREATE_TASK, title="Отдохнуть"),
+    ]
+    llm = SimpleNamespace(
+        parse_message=AsyncMock(return_value=AssistantDecision(actions=actions))
+    )
+    action_executor = SimpleNamespace(
+        execute_many=AsyncMock(return_value="Созданы три задачи")
+    )
+    use_case = ProcessMessageUseCase(
+        llm=llm,
+        action_executor=action_executor,  # type: ignore[arg-type]
+    )
+
+    result = await use_case.execute(
+        text="Завтра посмотреть фильм, поботать LLM-ки и отдохнуть",
+        now=now,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert result == "Созданы три задачи"
+    action_executor.execute_many.assert_awaited_once_with(
+        actions,
         user_id=42,
         now=now,
     )
@@ -46,7 +85,7 @@ async def test_process_message_parses_then_executes_decision() -> None:
 async def test_process_message_does_not_execute_when_llm_fails() -> None:
     error = RuntimeError("LLM unavailable")
     llm = SimpleNamespace(parse_message=AsyncMock(side_effect=error))
-    action_executor = SimpleNamespace(execute=AsyncMock())
+    action_executor = SimpleNamespace(execute_many=AsyncMock())
     use_case = ProcessMessageUseCase(
         llm=llm,
         action_executor=action_executor,  # type: ignore[arg-type]
@@ -61,17 +100,17 @@ async def test_process_message_does_not_execute_when_llm_fails() -> None:
         )
 
     assert exc.value is error
-    action_executor.execute.assert_not_awaited()
+    action_executor.execute_many.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_process_message_propagates_executor_failure() -> None:
     action = ChatAction(type=ActionType.CHAT, text="Ответ")
     llm = SimpleNamespace(
-        parse_message=AsyncMock(return_value=AssistantDecision(action=action))
+        parse_message=AsyncMock(return_value=AssistantDecision(actions=[action]))
     )
     error = RuntimeError("calendar unavailable")
-    action_executor = SimpleNamespace(execute=AsyncMock(side_effect=error))
+    action_executor = SimpleNamespace(execute_many=AsyncMock(side_effect=error))
     use_case = ProcessMessageUseCase(
         llm=llm,
         action_executor=action_executor,  # type: ignore[arg-type]

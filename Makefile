@@ -2,7 +2,7 @@ UV ?= uv
 IMAGE_NAME ?= personal-ai-assistant
 CONTAINER_NAME ?= personal-ai-assistant
 
-.PHONY: install run lint format typecheck test check docker-build docker-run docker-remove docker-stop docker-logs
+.PHONY: install run lint format typecheck test eval check docker-build docker-run docker-remove docker-stop docker-logs
 
 install:
 	$(UV) sync --all-groups
@@ -19,10 +19,13 @@ format:
 	$(UV) run ruff check . --fix
 
 typecheck:
-	$(UV) run mypy src tests
+	$(UV) run --group eval mypy src tests evals
 
 test:
 	$(UV) run pytest --cov=src --cov-branch --cov-report=term-missing
+
+eval:
+	$(UV) run --group eval pytest evals --run-llm-evals -m llm_eval -v --junitxml=eval-results/junit.xml -o junit_family=xunit1
 
 check: lint typecheck test
 

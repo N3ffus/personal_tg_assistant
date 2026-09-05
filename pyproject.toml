@@ -27,6 +27,9 @@ dev = [
     "pytest-cov>=7.0.0",
     "ruff>=0.16.2",
 ]
+eval = [
+    "deepeval>=3.9.9,<4",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -67,3 +70,8 @@ source = ["src"]
 [tool.coverage.report]
 fail_under = 90
 show_missing = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "evals"]
+addopts = "-p no:deepeval --strict-markers"
+markers = ["llm_eval: paid, live LLM calls; requires --run-llm-evals"]

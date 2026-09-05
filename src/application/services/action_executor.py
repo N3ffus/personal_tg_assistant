@@ -1,7 +1,17 @@
+from collections.abc import Sequence
 from datetime import datetime
 
-from src.application.ports.calendar import CalendarClient, PendingOperationStore
-from src.application.ports.tasks import TaskTrackerClient
+from src.application.ports.calendar import (
+    CalendarClient,
+    CalendarError,
+    CalendarNotConnectedError,
+    PendingOperationStore,
+)
+from src.application.ports.tasks import (
+    TaskCreationUncertainError,
+    TaskTrackerClient,
+    TaskTrackerError,
+)
 from src.domain.assistant.models import (
     AssistantAction,
     ChatAction,
@@ -26,6 +36,48 @@ class ActionExecutor:
         self._calendar = calendar
         self._pending_operations = pending_operations
         self._task_tracker = task_tracker
+
+    async def execute_many(
+        self,
+        actions: Sequence[AssistantAction],
+        *,
+        user_id: int,
+        now: datetime,
+    ) -> str:
+        if not actions:
+            raise ValueError("At least one action is required")
+
+        responses: list[str] = []
+        for action in actions:
+            try:
+                response = await self.execute(action, user_id=user_id, now=now)
+            except TaskCreationUncertainError:
+                if not isinstance(action, CreateTaskAction):
+                    raise
+                response = (
+                    f"⚠️ Linear мог создать задачу «{action.title}». "
+                    "Проверьте список задач перед повтором."
+                )
+            except TaskTrackerError:
+                if not isinstance(action, CreateTaskAction):
+                    raise
+                response = f"❌ Не удалось создать задачу «{action.title}» в Linear."
+            except CalendarNotConnectedError:
+                if not self._is_calendar_action(action):
+                    raise
+                response = (
+                    f"❌ {self._calendar_action_label(action)}: подключите календарь "
+                    "командой /calendar_connect."
+                )
+            except CalendarError:
+                if not self._is_calendar_action(action):
+                    raise
+                response = (
+                    f"❌ {self._calendar_action_label(action)}: календарь недоступен."
+                )
+            responses.append(response)
+
+        return "\n\n".join(responses)
 
     async def execute(
         self,
@@ -90,3 +142,22 @@ class ActionExecutor:
     def _event_result(verb: str, event: CalendarEvent) -> str:
         result = f"✅ {verb}: {event.title}\nВремя: {event.starts_at:%d.%m.%Y %H:%M}"
         return f"{result}\n{event.html_link}" if event.html_link else result
+
+    @staticmethod
+    def _is_calendar_action(action: AssistantAction) -> bool:
+        return isinstance(
+            action,
+            (CreateEventAction, ListEventsAction, UpdateEventAction, DeleteEventAction),
+        )
+
+    @staticmethod
+    def _calendar_action_label(action: AssistantAction) -> str:
+        if isinstance(action, CreateEventAction):
+            return f"Не удалось создать событие «{action.title}»"
+        if isinstance(action, UpdateEventAction):
+            return f"Не удалось изменить событие «{action.title}»"
+        if isinstance(action, DeleteEventAction):
+            return f"Не удалось удалить событие «{action.title}»"
+        if isinstance(action, ListEventsAction):
+            return "Не удалось получить события"
+        raise ValueError(f"Not a calendar action: {type(action)!r}")

@@ -62,8 +62,10 @@ LINEAR_TEAM_ID=your-team-uuid
 через `Cmd/Ctrl+K` → **Copy model UUID**. Запишите значения в
 `LINEAR_API_KEY` и `LINEAR_TEAM_ID`.
 
-Когда бот распознаёт действие `create_task`, он сразу создаёт issue в
-настроенной команде и возвращает его идентификатор и ссылку. Один
+Когда бот распознаёт одно или несколько действий `create_task`, он создаёт
+отдельный issue для каждого дела в исходном порядке и возвращает идентификатор
+и ссылку для каждой задачи. В одном сообщении можно сочетать создание задач и
+событий календаря. Один
 ключ и команда общие для экземпляра бота, поэтому свободный текст, LLM и
 создание Linear-задач доступны только Telegram-пользователю с ID из
 `TELEGRAM_ALLOWED_USER_ID`.
@@ -150,6 +152,7 @@ make docker-stop
 | `make format` | Отформатировать код и применить безопасные исправления Ruff |
 | `make typecheck` | Запустить строгую проверку типов mypy |
 | `make test` | Запустить pytest с branch coverage и обязательным порогом 90% |
+| `make eval` | Оценить 23 сценария промптов и интеграций через DeepEval и DeepInfra GLM-5.3-Flash |
 | `make check` | Запустить все проверки: Ruff, mypy и pytest |
 | `make docker-build` | Собрать Docker-образ `personal-ai-assistant` |
 | `make docker-run` | Собрать и запустить бота в Docker с `.env` |
@@ -161,6 +164,10 @@ make docker-stop
 ```bash
 make check
 ```
+
+DeepEval-тесты и настройка отдельного LLM-судьи описаны в
+[`evals/README.md`](evals/README.md). Обычные проверки работают без API-запросов;
+`make eval` требует `DEEPINFRA_API_KEY` и вызывает модель приложения и судью.
 
 Тот же gate запускается в GitHub Actions; дополнительно CI выполняет Bandit и
 pip-audit. Результаты последнего предрелизного ревью находятся в

@@ -220,3 +220,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local agent instructions may contain private deployment details.
+AGENTS.md
+
+# Local evaluation configuration and reports
+.env.eval
+.deepeval/
+.deepeval*
+eval-results/

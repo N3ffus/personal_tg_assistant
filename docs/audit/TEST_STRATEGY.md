@@ -29,6 +29,10 @@
 - Concurrency tests для single-use state/operations, Business cache и service supervisor.
 - Static gates: Ruff format/lint, strict mypy, Bandit.
 - Supply-chain gate: locked `uv` environment, pip-audit и SHA-pinned Actions.
+- Prompt/integration eval: 23 сценария с фиксированными датами и записываемыми
+  вызовами тестовых портов; DeepEval ToolCorrectness + G-Eval с DeepInfra
+  GLM-5.3-Flash. Живой платный запуск включается через `make eval`, см.
+  [`evals/README.md`](../../evals/README.md).
 
 ## Release gate
 
@@ -58,6 +62,10 @@ uvx bandit==1.9.4 -r src
 Тесты используют только временные SQLite files, fake API keys, mocked transports и
 synthetic user IDs. Настоящие `.env`, tokens и production data не должны читаться,
 логироваться или попадать в fixtures/snapshots.
+
+Исключение: явно запущенные LLM-evals читают ключи модели приложения и DeepInfra
+из `.env` / `.env.eval` для авторизованных API-вызовов. В тестовые запросы и отчёты
+попадают только синтетические сценарии, ответы и оценки, без credentials.
 
 ## Следующее усиление
 

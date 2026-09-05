@@ -44,7 +44,7 @@ jobs:
           uv run ruff check .
 
       - name: Type-check
-        run: uv run mypy src tests
+        run: uv run --group eval mypy src tests evals
 
       - name: Test with branch coverage
         run: uv run pytest --cov=src --cov-branch --cov-report=term-missing

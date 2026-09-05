@@ -30,8 +30,8 @@ class ProcessMessageUseCase:
             timezone=timezone,
         )
 
-        return await self._action_executor.execute(
-            decision.action,
+        return await self._action_executor.execute_many(
+            decision.actions,
             user_id=user_id,
             now=now,
         )

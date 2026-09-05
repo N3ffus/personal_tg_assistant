@@ -32,19 +32,20 @@ class GonkaGateLLMClient:
         instructions = (
             f"{SYSTEM_PROMPT}\n\n"
             "Верни только корректный JSON без Markdown и пояснений.\n"
-            "Поле action всегда должно быть объектом с полем type.\n"
-            'Пример chat: {"action":{"type":"chat","text":"Привет!"}}\n'
-            'Пример create_task: {"action":{"type":"create_task",'
-            '"title":"Купить продукты"}}\n'
-            'Пример create_event: {"action":{"type":"create_event",'
-            '"title":"Стоматолог","starts_at":"2026-08-13T15:00:00+03:00"}}\n'
-            'Пример list_events: {"action":{"type":"list_events"}}\n'
-            'Пример update_event: {"action":{"type":"update_event",'
-            '"title":"Стоматолог","starts_at":"2026-08-14T16:00:00+03:00"}}\n'
-            'Пример delete_event: {"action":{"type":"delete_event",'
-            '"title":"Стоматолог"}}\n'
-            'Пример save_note: {"action":{"type":"save_note",'
-            '"text":"Люблю Python"}}\n'
+            "Корневой объект всегда содержит массив actions.\n"
+            "Каждый элемент actions всегда является объектом с полем type.\n"
+            'Пример chat: {"actions":[{"type":"chat","text":"Привет!"}]}\n'
+            'Пример create_task: {"actions":[{"type":"create_task",'
+            '"title":"Купить продукты"}]}\n'
+            'Пример create_event: {"actions":[{"type":"create_event",'
+            '"title":"Стоматолог","starts_at":"2026-08-13T15:00:00+03:00"}]}\n'
+            'Пример list_events: {"actions":[{"type":"list_events"}]}\n'
+            'Пример update_event: {"actions":[{"type":"update_event",'
+            '"title":"Стоматолог","starts_at":"2026-08-14T16:00:00+03:00"}]}\n'
+            'Пример delete_event: {"actions":[{"type":"delete_event",'
+            '"title":"Стоматолог"}]}\n'
+            'Пример save_note: {"actions":[{"type":"save_note",'
+            '"text":"Люблю Python"}]}\n'
             f"Текущее время: {now.isoformat()}\n"
             f"Timezone пользователя: {timezone}"
         )
@@ -68,13 +69,24 @@ class GonkaGateLLMClient:
 
         decision_data: Any = json.loads(content)
 
-        if isinstance(decision_data, dict) and isinstance(
-            decision_data.get("action"), str
-        ):
-            action_type = decision_data.pop("action")
-            decision_data = {"action": {"type": action_type, **decision_data}}
+        decision_data = self._normalize_legacy_decision(decision_data)
 
         return AssistantDecision.model_validate(decision_data)
+
+    @staticmethod
+    def _normalize_legacy_decision(decision_data: Any) -> Any:
+        if not isinstance(decision_data, dict) or "actions" in decision_data:
+            return decision_data
+
+        action = decision_data.get("action")
+        if isinstance(action, dict):
+            return {"actions": [action]}
+        if isinstance(action, str):
+            payload = {
+                key: value for key, value in decision_data.items() if key != "action"
+            }
+            return {"actions": [{"type": action, **payload}]}
+        return decision_data
 
     async def close(self) -> None:
         await self._client.close()
