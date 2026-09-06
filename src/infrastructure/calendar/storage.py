@@ -22,7 +22,8 @@ class CalendarStorage:
                 CREATE TABLE IF NOT EXISTS oauth_states (
                     state TEXT PRIMARY KEY,
                     telegram_user_id INTEGER NOT NULL,
-                    expires_at TEXT NOT NULL
+                    expires_at TEXT NOT NULL,
+                    code_verifier BLOB
                 );
                 CREATE TABLE IF NOT EXISTS calendar_connections (
                     telegram_user_id INTEGER PRIMARY KEY,
@@ -41,12 +42,19 @@ class CalendarStorage:
                     ON pending_operations (expires_at);
                 """
             )
+            cursor = await database.execute("PRAGMA table_info(oauth_states)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            if "code_verifier" not in columns:
+                await database.execute(
+                    "ALTER TABLE oauth_states ADD COLUMN code_verifier BLOB"
+                )
             await self._purge_expired(database)
             await database.commit()
 
-    async def create_oauth_state(self, *, user_id: int) -> str:
+    async def create_oauth_state(self, *, user_id: int, code_verifier: str) -> str:
         state = secrets.token_urlsafe(32)
         expires_at = self._expires_in(minutes=10)
+        encrypted_verifier = self._cipher.encrypt(code_verifier.encode())
         async with aiosqlite.connect(self._database_path) as database:
             await self._purge_expired(database)
             await database.execute(
@@ -54,24 +62,30 @@ class CalendarStorage:
                 (user_id,),
             )
             await database.execute(
-                "INSERT INTO oauth_states VALUES (?, ?, ?)",
-                (state, user_id, expires_at),
+                """INSERT INTO oauth_states
+                (state, telegram_user_id, expires_at, code_verifier)
+                VALUES (?, ?, ?, ?)""",
+                (state, user_id, expires_at, encrypted_verifier),
             )
             await database.commit()
         return state
 
-    async def consume_oauth_state(self, *, state: str) -> int | None:
+    async def consume_oauth_state(self, *, state: str) -> tuple[int, str] | None:
         async with aiosqlite.connect(self._database_path) as database:
             cursor = await database.execute(
                 """DELETE FROM oauth_states WHERE state = ?
-                RETURNING telegram_user_id, expires_at""",
+                RETURNING telegram_user_id, expires_at, code_verifier""",
                 (state,),
             )
             row = await cursor.fetchone()
             await database.commit()
-        if row is None or datetime.fromisoformat(row[1]) <= datetime.now(UTC):
+        if (
+            row is None
+            or datetime.fromisoformat(row[1]) <= datetime.now(UTC)
+            or row[2] is None
+        ):
             return None
-        return int(row[0])
+        return int(row[0]), self._cipher.decrypt(row[2]).decode()
 
     async def save_credentials(
         self, *, user_id: int, credentials: Mapping[str, object]

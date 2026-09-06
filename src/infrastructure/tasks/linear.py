@@ -2,8 +2,14 @@ from typing import Any
 
 import httpx
 
-from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
-from src.domain.tasks.models import CreatedTask
+from src.application.ports.tasks import (
+    TaskCreationUncertainError,
+    TaskDeletionUncertainError,
+    TaskNotFoundError,
+    TaskTrackerError,
+)
+from src.domain.assistant.deletions import DeletionTarget
+from src.domain.tasks.models import CreatedTask, Task
 
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 
@@ -17,6 +23,30 @@ mutation CreateIssue($input: IssueCreateInput!) {
       url
     }
   }
+}
+"""
+
+FIND_ISSUES_QUERY = """
+query FindIssues($filter: IssueFilter!, $after: String) {
+  issues(filter: $filter, first: 100, after: $after, includeArchived: true) {
+    nodes { id identifier title trashed }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+LIST_ISSUES_QUERY = """
+query ListIssues($filter: IssueFilter!, $after: String) {
+  issues(filter: $filter, first: 100, after: $after, includeArchived: false) {
+    nodes { identifier title url trashed state { name } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+DELETE_ISSUE_MUTATION = """
+mutation DeleteIssue($id: String!) {
+  issueDelete(id: $id) { success }
 }
 """
 
@@ -101,6 +131,167 @@ class LinearTaskClient:
             title=returned_title,
             url=url,
         )
+
+    async def _query(
+        self, *, query: str, variables: dict[str, object]
+    ) -> dict[str, Any]:
+        try:
+            response = await self._client.post(
+                LINEAR_GRAPHQL_URL, json={"query": query, "variables": variables}
+            )
+            response.raise_for_status()
+            payload: Any = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise TaskTrackerError("Linear request failed") from error
+        if not isinstance(payload, dict) or payload.get("errors"):
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            detail = ""
+            if isinstance(errors, list) and errors:
+                first = errors[0]
+                if isinstance(first, dict) and first.get("message"):
+                    detail = f": {first['message']}"
+            raise TaskTrackerError(f"Linear rejected the request{detail}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise TaskTrackerError("Linear returned an invalid response")
+        return data
+
+    async def list_tasks(self) -> list[Task]:
+        tasks: dict[str, Task] = {}
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._query(
+                query=LIST_ISSUES_QUERY,
+                variables={
+                    "filter": {"team": {"id": {"eq": self._team_id}}},
+                    "after": cursor,
+                },
+            )
+            issues = data.get("issues")
+            if not isinstance(issues, dict) or not isinstance(
+                issues.get("nodes"), list
+            ):
+                raise TaskTrackerError("Linear returned invalid issues")
+            for issue in issues["nodes"]:
+                if not isinstance(issue, dict) or any(
+                    not isinstance(issue.get(key), str) or not issue[key].strip()
+                    for key in ("identifier", "title", "url")
+                ):
+                    raise TaskTrackerError("Linear returned an invalid issue")
+                if issue.get("trashed") is True:
+                    continue
+                state = issue.get("state")
+                if (
+                    not isinstance(state, dict)
+                    or not isinstance(state.get("name"), str)
+                    or not state["name"].strip()
+                ):
+                    raise TaskTrackerError("Linear returned an invalid issue status")
+                tasks[issue["identifier"]] = Task(
+                    identifier=issue["identifier"],
+                    title=issue["title"],
+                    url=issue["url"],
+                    status=state["name"],
+                )
+            page = issues.get("pageInfo")
+            if not isinstance(page, dict) or not isinstance(
+                page.get("hasNextPage"), bool
+            ):
+                raise TaskTrackerError("Linear returned invalid pagination")
+            if not page["hasNextPage"]:
+                return list(tasks.values())
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise TaskTrackerError("Linear returned invalid pagination")
+            seen_cursors.add(cursor)
+
+    async def find_tasks(self, *, title: str | None) -> list[DeletionTarget]:
+        import re
+
+        if title is not None and not title.strip():
+            raise TaskTrackerError("Task search must not be blank")
+        issue_filter: dict[str, object] = {"team": {"id": {"eq": self._team_id}}}
+        identifier = (
+            re.fullmatch(r"([A-Za-z][A-Za-z0-9]*)-(\d+)", title.strip())
+            if title
+            else None
+        )
+        if identifier:
+            issue_filter["number"] = {"eq": int(identifier[2])}
+            # The team ID always remains in the filter; a foreign identifier
+            # must never resolve to the same issue number in this team.
+        elif title is not None:
+            issue_filter["title"] = {"containsIgnoreCase": title.strip()}
+        targets: dict[str, DeletionTarget] = {}
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            data = await self._query(
+                query=FIND_ISSUES_QUERY,
+                variables={"filter": issue_filter, "after": cursor},
+            )
+            issues = data.get("issues")
+            if not isinstance(issues, dict) or not isinstance(
+                issues.get("nodes"), list
+            ):
+                raise TaskTrackerError("Linear returned invalid issues")
+            for issue in issues["nodes"]:
+                if not isinstance(issue, dict) or any(
+                    not isinstance(issue.get(key), str) or not issue[key].strip()
+                    for key in ("id", "identifier", "title")
+                ):
+                    raise TaskTrackerError("Linear returned an invalid issue")
+                if issue.get("trashed") is True:
+                    continue
+                if (
+                    identifier
+                    and title is not None
+                    and issue["identifier"].casefold() != title.strip().casefold()
+                ):
+                    continue
+                targets[issue["id"]] = DeletionTarget(
+                    id=issue["id"],
+                    title=issue["title"],
+                    label=f"{issue['identifier']}: {issue['title']}",
+                )
+            page = issues.get("pageInfo")
+            if not isinstance(page, dict) or not isinstance(
+                page.get("hasNextPage"), bool
+            ):
+                raise TaskTrackerError("Linear returned invalid pagination")
+            if not page["hasNextPage"]:
+                return list(targets.values())
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise TaskTrackerError("Linear returned invalid pagination")
+            seen_cursors.add(cursor)
+
+    async def delete_task(self, *, task_id: str) -> None:
+        try:
+            data = await self._query(
+                query=DELETE_ISSUE_MUTATION, variables={"id": task_id}
+            )
+        except TaskTrackerError as error:
+            if isinstance(
+                error.__cause__,
+                (
+                    httpx.ReadTimeout,
+                    httpx.WriteTimeout,
+                    httpx.ReadError,
+                    httpx.WriteError,
+                    httpx.RemoteProtocolError,
+                ),
+            ):
+                raise TaskDeletionUncertainError(
+                    "Linear deletion result is uncertain"
+                ) from error
+            if "not found" in str(error).lower():
+                raise TaskNotFoundError("Linear task not found") from error
+            raise
+        result = data.get("issueDelete")
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise TaskTrackerError("Linear did not delete the task")
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import secrets
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
@@ -36,8 +37,11 @@ class GoogleOAuthService:
         self._redirect_uri = redirect_uri
 
     async def authorization_url(self, *, user_id: int) -> str:
-        state = await self._storage.create_oauth_state(user_id=user_id)
-        flow = self._flow()
+        code_verifier = secrets.token_urlsafe(64)
+        state = await self._storage.create_oauth_state(
+            user_id=user_id, code_verifier=code_verifier
+        )
+        flow = self._flow(code_verifier=code_verifier)
         url, _ = flow.authorization_url(
             access_type="offline",
             include_granted_scopes="true",
@@ -47,10 +51,11 @@ class GoogleOAuthService:
         return str(url)
 
     async def complete(self, *, code: str, state: str) -> bool:
-        user_id = await self._storage.consume_oauth_state(state=state)
-        if user_id is None:
+        oauth_state = await self._storage.consume_oauth_state(state=state)
+        if oauth_state is None:
             return False
-        flow = self._flow(state=state)
+        user_id, code_verifier = oauth_state
+        flow = self._flow(state=state, code_verifier=code_verifier)
         await asyncio.to_thread(flow.fetch_token, code=code)
         await self._storage.save_credentials(
             user_id=user_id,
@@ -58,7 +63,7 @@ class GoogleOAuthService:
         )
         return True
 
-    def _flow(self, *, state: str | None = None) -> Flow:
+    def _flow(self, *, code_verifier: str, state: str | None = None) -> Flow:
         return Flow.from_client_config(
             {
                 "web": {
@@ -72,6 +77,8 @@ class GoogleOAuthService:
             scopes=SCOPES,
             redirect_uri=self._redirect_uri,
             state=state,
+            code_verifier=code_verifier,
+            autogenerate_code_verifier=False,
         )
 
     @staticmethod

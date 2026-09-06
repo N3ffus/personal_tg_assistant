@@ -36,6 +36,40 @@ class Scenario:
 
 SCENARIOS = (
     Scenario(
+        "delete_linear_task",
+        "Удали задачу ENG-42 в Linear",
+        ({"type": "delete_task", "title": "ENG-42"},),
+        ("linear.find_tasks",),
+        "Найти задачу ENG-42 и показать подтверждение кнопкой, без удаления.",
+        ("Удалить", "ENG-42", "Подтвердите кнопкой"),
+    ),
+    Scenario(
+        "delete_all_calendar_events",
+        "Удали все события в календаре",
+        ({"type": "delete_all_events"},),
+        ("calendar.find_events",),
+        "Показать список всех событий основного календаря и подтверждение кнопкой, без удаления.",
+        ("Удалить все", "Google Calendar", "Подтвердите кнопкой"),
+    ),
+    *(
+        Scenario(
+            f"delete_all_linear_{index}",
+            prompt,
+            ({"type": "delete_all_tasks"},),
+            ("linear.find_tasks",),
+            "Показать список задач Linear и запросить inline-подтверждение без лишних уточнений и без удаления.",
+            ("Удалить все", "Linear", "Подтвердите кнопкой"),
+        )
+        for index, prompt in enumerate(
+            [
+                "Удали все задачи с Linear",
+                "Удали все задачи в Linear",
+                "Удали все задачи с Linear все",
+                "Удали все задачи с Linear подтверждаю",
+            ]
+        )
+    ),
+    Scenario(
         "greeting",
         "Привет!",
         ({"type": "chat", "text": "Привет! Чем помочь?"},),
@@ -167,7 +201,37 @@ SCENARIOS = (
         ({"type": "list_events"},),
         ("calendar.list_events",),
         "Показать возвращённую календарём встречу команды в 14:00 без вымышленных событий.",
-        ("Встреча команды", "05.09 14:00"),
+        ("Встреча команды", "05.09.2026 14:00"),
+    ),
+    Scenario(
+        "list_tasks",
+        "Какие у меня задачи в Linear?",
+        ({"type": "list_tasks"},),
+        ("linear.list_tasks",),
+        "Показать задачи Linear со статусами и ссылками, не создавать новые.",
+        (
+            "EVAL-1",
+            "Подготовить отчёт",
+            "In Progress",
+            "https://linear.example/issue/EVAL-1",
+        ),
+    ),
+    Scenario(
+        "list_agenda",
+        "Покажи задачи из Linear и события календаря",
+        ({"type": "list_tasks"}, {"type": "list_events"}),
+        ("linear.list_tasks", "calendar.list_events"),
+        "Показать и задачи Linear, и события календаря без создания и удаления.",
+        ("EVAL-1", "Встреча команды"),
+    ),
+    Scenario(
+        "agenda_linear_error",
+        "/agenda",
+        ({"type": "list_tasks"}, {"type": "list_events"}),
+        ("linear.list_tasks", "calendar.list_events"),
+        "Сообщить об ошибке чтения Linear и показать события календаря.",
+        ("Не удалось получить задачи Linear", "Встреча команды"),
+        failure="linear_error",
     ),
     Scenario(
         "empty_calendar",
@@ -211,9 +275,9 @@ SCENARIOS = (
         "delete_confirmation",
         "Удали событие «Стоматолог»",
         ({"type": "delete_event", "title": "Стоматолог"},),
-        (),
-        "Направить к кнопке удаления события через /calendar. Не удалять без подтверждения и не сообщать об успехе.",
-        ("Удалить", "/calendar"),
+        ("calendar.find_events",),
+        "Найти событие и показать inline-подтверждение. Не удалять до нажатия кнопки и не сообщать об успехе.",
+        ("Удалить", "Стоматолог", "Подтвердите кнопкой"),
     ),
     Scenario(
         "save_note",

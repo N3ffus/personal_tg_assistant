@@ -6,10 +6,16 @@ from src.application.ports.calendar import CalendarError, CalendarNotConnectedEr
 from src.application.ports.llm import LLMClient
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
 from src.application.services.action_executor import ActionExecutor
+from src.application.services.explicit_commands import (
+    parse_bulk_deletion,
+    parse_view_request,
+)
 from src.application.use_cases.process_message import ProcessMessageUseCase
+from src.domain.assistant.deletions import DeletionTarget
 from src.domain.assistant.models import AssistantDecision
+from src.domain.assistant.replies import AssistantReply
 from src.domain.calendar.models import CalendarEvent
-from src.domain.tasks.models import CreatedTask
+from src.domain.tasks.models import CreatedTask, Task
 
 
 @dataclass
@@ -28,6 +34,71 @@ class RecordingIntegrations:
     calls: list[RecordedCall] = field(default_factory=list)
     task_count: int = 0
     selection_consumed: bool = False
+
+    async def find_tasks(self, *, title: str | None) -> list[DeletionTarget]:
+        targets = [
+            DeletionTarget(
+                id="eval-task",
+                title=title or "Тестовая задача",
+                label=f"EVAL-1: {title or 'Тестовая задача'}",
+            )
+        ]
+        self.calls.append(
+            RecordedCall(
+                "linear.find_tasks", {"title": title}, [t.model_dump() for t in targets]
+            )
+        )
+        return targets
+
+    async def delete_task(self, *, task_id: str) -> None:
+        raise AssertionError("Natural-language deletion must require confirmation")
+
+    async def find_events(
+        self, *, user_id: int, title: str | None
+    ) -> list[DeletionTarget]:
+        targets = [
+            DeletionTarget(
+                id="eval-event",
+                title=title or "Встреча",
+                label=f"06.09.2026 12:00 — {title or 'Встреча'}",
+            )
+        ]
+        self.calls.append(
+            RecordedCall(
+                "calendar.find_events",
+                {"user_id": user_id, "title": title},
+                [t.model_dump() for t in targets],
+            )
+        )
+        return targets
+
+    async def create_operation(
+        self, *, user_id: int, kind: str, payload: dict[str, object]
+    ) -> str:
+        assert user_id == self.scenario.user_id
+        assert kind == "delete_confirm"
+        return "eval-confirmation"
+
+    async def consume_operation(
+        self, *, operation_id: str, user_id: int
+    ) -> tuple[str, dict[str, object]] | None:
+        raise AssertionError("Natural-language input must not consume confirmations")
+
+    async def list_tasks(self) -> list[Task]:
+        self.calls.append(RecordedCall("linear.list_tasks", {}))
+        if self.scenario.failure == "linear_error":
+            self.calls[-1].error = "TaskTrackerError"
+            raise TaskTrackerError()
+        tasks = [
+            Task(
+                identifier="EVAL-1",
+                title="Подготовить отчёт",
+                status="In Progress",
+                url="https://linear.example/issue/EVAL-1",
+            )
+        ]
+        self.calls[-1].output = [asdict(task) for task in tasks]
+        return tasks
 
     async def create_task(self, *, title: str) -> CreatedTask:
         self.calls.append(RecordedCall("linear.create_task", {"title": title}))
@@ -155,10 +226,10 @@ class RecordingLLM:
     decision: AssistantDecision | None = None
 
     async def parse_message(
-        self, *, text: str, now: datetime, timezone: str
+        self, *, text: str, now: datetime, timezone: str, context: str = ""
     ) -> AssistantDecision:
         self.decision = await self.inner.parse_message(
-            text=text, now=now, timezone=timezone
+            text=text, now=now, timezone=timezone, context=context
         )
         return self.decision
 
@@ -187,5 +258,12 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
         timezone=scenario.timezone,
         user_id=scenario.user_id,
     )
-    assert recording_llm.decision is not None
-    return EvaluationRun(recording_llm.decision, integrations.calls, reply)
+    decision = (
+        recording_llm.decision
+        or parse_view_request(scenario.prompt)
+        or parse_bulk_deletion(scenario.prompt)
+    )
+    assert decision is not None
+    if isinstance(reply, AssistantReply):
+        reply = "\n\n".join([reply.text, *(c.text for c in reply.confirmations)])
+    return EvaluationRun(decision, integrations.calls, reply)

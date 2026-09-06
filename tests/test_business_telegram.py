@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiogram import Router
@@ -16,6 +16,7 @@ from aiogram.types import (
     User,
 )
 
+from src.domain.assistant.context import ContextChat
 from src.infrastructure.telegram.business import (
     REJECTED_CONNECTION_LIMIT,
     create_business_router,
@@ -26,6 +27,66 @@ ALLOWED_USER_ID = 42
 CUSTOMER_USER_ID = 99
 CONNECTION_ID = "business-connection-1"
 FIXED_DATE = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender_id", [ALLOWED_USER_ID, CUSTOMER_USER_ID])
+async def test_extraction_is_submitted_only_after_context_save(sender_id: int) -> None:
+    contexts = AsyncMock()
+    chat = ContextChat(
+        id=3, owner_id=ALLOWED_USER_ID, kind="business", chat_id=1001, title="Анна"
+    )
+    contexts.ensure_chat.return_value = chat
+    extractor = Mock()
+    extractor.submit.side_effect = lambda _: contexts.record.assert_awaited_once()
+    router = create_business_router(
+        allowed_user_id=ALLOWED_USER_ID, contexts=contexts, extractor=extractor
+    )
+    bot = make_bot(make_connection())
+    incoming = make_message(sender_id=sender_id).model_copy(
+        update={
+            "text": "Сделаю аудит",
+            "chat": Chat(id=1001, type="private", first_name="Анна", username="anna"),
+        }
+    )
+    await find_handler(router, "business_message", "read_business_message")(
+        incoming, bot
+    )
+    extractor.submit.assert_called_once_with(chat)
+    saved = contexts.record.await_args.kwargs["message"]
+    assert saved.sender_id == sender_id and not saved.is_business_bot
+    assert "@anna" in contexts.ensure_chat.await_args.kwargs["title"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["save_failure", "business_bot", "no_author", "foreign_owner"]
+)
+async def test_extraction_does_not_run_for_unsaved_or_untrusted_messages(
+    case: str,
+) -> None:
+    contexts, extractor = AsyncMock(), Mock()
+    contexts.ensure_chat.return_value = ContextChat(
+        id=3, owner_id=ALLOWED_USER_ID, kind="business", chat_id=1001, title="Анна"
+    )
+    if case == "save_failure":
+        contexts.record.side_effect = RuntimeError("storage unavailable")
+    router = create_business_router(
+        allowed_user_id=ALLOWED_USER_ID, contexts=contexts, extractor=extractor
+    )
+    bot = make_bot(
+        make_connection(owner_id=7 if case == "foreign_owner" else ALLOWED_USER_ID)
+    )
+    incoming = make_message(
+        sender_id=None if case == "no_author" else ALLOWED_USER_ID,
+        sender_business_bot=make_user(777, is_bot=True)
+        if case == "business_bot"
+        else None,
+    ).model_copy(update={"caption": "Сделаю аудит"})
+    await find_handler(router, "business_message", "read_business_message")(
+        incoming, bot
+    )
+    extractor.submit.assert_not_called()
 
 
 def find_handler(router: Router, observer: str, name: str) -> Handler:

@@ -58,6 +58,7 @@ async def test_openai_client_requests_structured_decision_with_user_context() ->
     assert f"Текущее время: {NOW.isoformat()}" in kwargs["instructions"]
     assert "Timezone пользователя: Europe/Moscow" in kwargs["instructions"]
     assert "list_events" in kwargs["instructions"]
+    assert "list_tasks" in kwargs["instructions"]
     assert "update_event" in kwargs["instructions"]
     assert "delete_event" in kwargs["instructions"]
     assert "в массиве actions" in kwargs["instructions"]
@@ -136,6 +137,7 @@ async def test_gonkagate_client_includes_json_contract_and_user_context() -> Non
     assert f"Текущее время: {NOW.isoformat()}" in instructions
     assert "Timezone пользователя: Europe/Moscow" in instructions
     assert '"type":"update_event"' in instructions
+    assert '"type":"list_tasks"' in instructions
     assert '"type":"delete_event"' in instructions
     assert "Корневой объект всегда содержит массив actions" in instructions
     assert kwargs["response_format"] == {"type": "json_object"}

@@ -14,7 +14,7 @@ class GoldenLLM:
     scenario: Scenario
 
     async def parse_message(
-        self, *, text: str, now: datetime, timezone: str
+        self, *, text: str, now: datetime, timezone: str, context: str = ""
     ) -> AssistantDecision:
         assert text == self.scenario.prompt
         assert now == self.scenario.now

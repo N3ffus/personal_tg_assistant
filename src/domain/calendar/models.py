@@ -9,3 +9,4 @@ class CalendarEvent:
     starts_at: datetime
     ends_at: datetime
     html_link: str | None
+    all_day: bool = False

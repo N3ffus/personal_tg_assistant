@@ -93,7 +93,7 @@ def create_calendar_router(
             return
         await answer_text(
             message,
-            ActionExecutor.format_events(events),
+            ActionExecutor.format_events(events, timezone=ZoneInfo(timezone)),
             reply_markup=(
                 _event_keyboard(events, selection_ids) if selection_ids else None
             ),
@@ -230,21 +230,24 @@ def create_calendar_router(
 def _event_keyboard(
     events: list[CalendarEvent], selection_ids: list[str]
 ) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
+    rows = []
+    for event, selection_id in zip(events, selection_ids, strict=True):
+        row = []
+        if not event.all_day:
+            row.append(
                 InlineKeyboardButton(
                     text=f"Изменить: {event.title}"[:64],
                     callback_data=f"caledit:{selection_id}",
-                ),
-                InlineKeyboardButton(
-                    text=f"Удалить: {event.title}"[:64],
-                    callback_data=f"caldel:{selection_id}",
-                ),
-            ]
-            for event, selection_id in zip(events, selection_ids, strict=True)
-        ]
-    )
+                )
+            )
+        row.append(
+            InlineKeyboardButton(
+                text=f"Удалить: {event.title}"[:64],
+                callback_data=f"caldel:{selection_id}",
+            )
+        )
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _allowed_message_user_id(message: Message, allowed_user_id: int) -> int | None:

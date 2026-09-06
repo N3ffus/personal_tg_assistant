@@ -39,13 +39,77 @@ async def test_initialize_creates_parent_directory_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_initialize_migrates_existing_database_without_losing_connections(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "calendar.db"
+    key = Fernet.generate_key()
+    encrypted_credentials = Fernet(key).encrypt(b'{"token": "existing-token"}')
+    async with aiosqlite.connect(database_path) as database:
+        await database.executescript(
+            """
+            CREATE TABLE oauth_states (
+                state TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE calendar_connections (
+                telegram_user_id INTEGER PRIMARY KEY,
+                credentials BLOB NOT NULL
+            );
+            """
+        )
+        await database.execute(
+            "INSERT INTO oauth_states VALUES (?, ?, ?)",
+            ("legacy-state", 42, "2099-01-01T00:00:00+00:00"),
+        )
+        await database.execute(
+            "INSERT INTO calendar_connections VALUES (?, ?)",
+            (42, encrypted_credentials),
+        )
+        await database.commit()
+    storage = make_storage(database_path, key=key)
+
+    await storage.initialize()
+    await storage.initialize()
+
+    assert await storage.load_credentials(user_id=42) == {"token": "existing-token"}
+    assert await storage.consume_oauth_state(state="legacy-state") is None
+    state = await storage.create_oauth_state(user_id=42, code_verifier="new-verifier")
+    assert await storage.consume_oauth_state(state=state) == (42, "new-verifier")
+
+
+@pytest.mark.asyncio
+async def test_oauth_verifier_is_encrypted_and_restored_after_restart(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "calendar.db"
+    key = Fernet.generate_key()
+    storage = make_storage(database_path, key=key)
+    await storage.initialize()
+    verifier = "secret-pkce-verifier"
+    state = await storage.create_oauth_state(user_id=42, code_verifier=verifier)
+
+    async with aiosqlite.connect(database_path) as database:
+        cursor = await database.execute(
+            "SELECT code_verifier FROM oauth_states WHERE state = ?", (state,)
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert verifier.encode() not in bytes(row[0])
+    assert Fernet(key).decrypt(row[0]).decode() == verifier
+    restarted_storage = make_storage(database_path, key=key)
+    assert await restarted_storage.consume_oauth_state(state=state) == (42, verifier)
+
+
+@pytest.mark.asyncio
 async def test_oauth_state_is_bound_to_user_and_single_use(tmp_path: Path) -> None:
     storage = make_storage(tmp_path / "calendar.db")
     await storage.initialize()
 
-    state = await storage.create_oauth_state(user_id=42)
+    state = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
 
-    assert await storage.consume_oauth_state(state=state) == 42
+    assert await storage.consume_oauth_state(state=state) == (42, "verifier-42")
     assert await storage.consume_oauth_state(state=state) is None
 
 
@@ -54,13 +118,13 @@ async def test_oauth_states_are_random_and_independent(tmp_path: Path) -> None:
     storage = make_storage(tmp_path / "calendar.db")
     await storage.initialize()
 
-    first = await storage.create_oauth_state(user_id=42)
-    second = await storage.create_oauth_state(user_id=7)
+    first = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
+    second = await storage.create_oauth_state(user_id=7, code_verifier="verifier-7")
 
     assert first != second
     assert len(first) >= 32
-    assert await storage.consume_oauth_state(state=second) == 7
-    assert await storage.consume_oauth_state(state=first) == 42
+    assert await storage.consume_oauth_state(state=second) == (7, "verifier-7")
+    assert await storage.consume_oauth_state(state=first) == (42, "verifier-42")
 
 
 @pytest.mark.asyncio
@@ -70,11 +134,11 @@ async def test_new_oauth_state_invalidates_previous_state_for_same_user(
     storage = make_storage(tmp_path / "calendar.db")
     await storage.initialize()
 
-    previous = await storage.create_oauth_state(user_id=42)
-    current = await storage.create_oauth_state(user_id=42)
+    previous = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
+    current = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
 
     assert await storage.consume_oauth_state(state=previous) is None
-    assert await storage.consume_oauth_state(state=current) == 42
+    assert await storage.consume_oauth_state(state=current) == (42, "verifier-42")
 
 
 @pytest.mark.asyncio
@@ -82,7 +146,7 @@ async def test_expired_oauth_state_is_rejected_and_removed(tmp_path: Path) -> No
     database_path = tmp_path / "calendar.db"
     storage = make_storage(database_path)
     await storage.initialize()
-    state = await storage.create_oauth_state(user_id=42)
+    state = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
     async with aiosqlite.connect(database_path) as database:
         await database.execute(
             "UPDATE oauth_states SET expires_at = ? WHERE state = ?",
@@ -100,14 +164,17 @@ async def test_oauth_state_can_only_be_consumed_once_under_concurrency(
 ) -> None:
     storage = make_storage(tmp_path / "calendar.db")
     await storage.initialize()
-    state = await storage.create_oauth_state(user_id=42)
+    state = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
 
     results = await asyncio.gather(
         storage.consume_oauth_state(state=state),
         storage.consume_oauth_state(state=state),
     )
 
-    assert sorted(results, key=lambda value: value is None) == [42, None]
+    assert sorted(results, key=lambda value: value is None) == [
+        (42, "verifier-42"),
+        None,
+    ]
 
 
 @pytest.mark.asyncio
@@ -373,7 +440,7 @@ async def test_initialize_purges_abandoned_expired_records(tmp_path: Path) -> No
     await storage.initialize()
     async with aiosqlite.connect(database_path) as database:
         await database.execute(
-            "INSERT INTO oauth_states VALUES (?, ?, ?)",
+            "INSERT INTO oauth_states (state, telegram_user_id, expires_at) VALUES (?, ?, ?)",
             ("expired-state", 42, "2000-01-01T00:00:00+00:00"),
         )
         await database.execute(
@@ -414,12 +481,12 @@ async def test_creating_state_purges_previous_expired_rows(tmp_path: Path) -> No
     await storage.initialize()
     async with aiosqlite.connect(database_path) as database:
         await database.execute(
-            "INSERT INTO oauth_states VALUES (?, ?, ?)",
+            "INSERT INTO oauth_states (state, telegram_user_id, expires_at) VALUES (?, ?, ?)",
             ("abandoned", 42, "2000-01-01T00:00:00+00:00"),
         )
         await database.commit()
 
-    current = await storage.create_oauth_state(user_id=42)
+    current = await storage.create_oauth_state(user_id=42, code_verifier="verifier-42")
 
     async with aiosqlite.connect(database_path) as database:
         cursor = await database.execute("SELECT state FROM oauth_states ORDER BY state")

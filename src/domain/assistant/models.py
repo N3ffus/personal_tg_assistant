@@ -22,6 +22,19 @@ class CreateTaskAction(DomainModel):
     title: str
 
 
+class ListTasksAction(DomainModel):
+    type: Literal[ActionType.LIST_TASKS]
+
+
+class DeleteTaskAction(DomainModel):
+    type: Literal[ActionType.DELETE_TASK]
+    title: str = Field(min_length=1)
+
+
+class DeleteAllTasksAction(DomainModel):
+    type: Literal[ActionType.DELETE_ALL_TASKS]
+
+
 class CreateEventAction(DomainModel):
     type: Literal[ActionType.CREATE_EVENT]
     title: str
@@ -40,7 +53,11 @@ class UpdateEventAction(DomainModel):
 
 class DeleteEventAction(DomainModel):
     type: Literal[ActionType.DELETE_EVENT]
-    title: str
+    title: str = Field(min_length=1)
+
+
+class DeleteAllEventsAction(DomainModel):
+    type: Literal[ActionType.DELETE_ALL_EVENTS]
 
 
 class SaveNoteAction(DomainModel):
@@ -51,10 +68,14 @@ class SaveNoteAction(DomainModel):
 AssistantAction = Annotated[
     ChatAction
     | CreateTaskAction
+    | ListTasksAction
+    | DeleteTaskAction
+    | DeleteAllTasksAction
     | CreateEventAction
     | ListEventsAction
     | UpdateEventAction
     | DeleteEventAction
+    | DeleteAllEventsAction
     | SaveNoteAction,
     Field(discriminator="type"),
 ]

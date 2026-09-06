@@ -16,7 +16,6 @@ from src.domain.assistant.models import (
     ChatAction,
     CreateEventAction,
     CreateTaskAction,
-    DeleteEventAction,
     ListEventsAction,
     SaveNoteAction,
     UpdateEventAction,
@@ -216,10 +215,6 @@ async def test_execute_many_rejects_empty_batch() -> None:
     [
         (ChatAction(type=ActionType.CHAT, text="Привет"), "Привет"),
         (
-            DeleteEventAction(type=ActionType.DELETE_EVENT, title="Стоматолог"),
-            "Выберите «Удалить» у события «Стоматолог» через /calendar.",
-        ),
-        (
             SaveNoteAction(type=ActionType.SAVE_NOTE, text="Люблю Python"),
             "📝 Понял, нужно сохранить заметку:\nЛюблю Python",
         ),
@@ -310,7 +305,10 @@ async def test_list_events_passes_current_time_and_formats_results() -> None:
     result = await executor.execute(action, user_id=42, now=NOW)
 
     calendar.list_events.assert_awaited_once_with(user_id=42, now=NOW)
-    assert result == "📅 Ближайшие события:\n• 04.09 15:30 — Стоматолог"
+    assert result == (
+        "📅 Ближайшие события Google Calendar (до 10):\n"
+        "• 04.09.2026 15:30 UTC — Стоматолог\nhttps://calendar.test/event-1"
+    )
 
 
 @pytest.mark.asyncio
@@ -376,6 +374,7 @@ async def test_update_event_uses_selected_event_id_once() -> None:
         title="Новый стоматолог",
         starts_at=EVENT_START,
     )
+    assert isinstance(result, str)
     assert result.startswith("✅ Событие изменено: Новый стоматолог")
 
 

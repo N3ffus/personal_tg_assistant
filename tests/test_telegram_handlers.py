@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import pytest
-from aiogram import Router
+from aiogram import Bot, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import EditMessageReplyMarkup, SetMyCommands
+from aiogram.types import Message
 
 from src.application.ports.calendar import (
     CalendarError,
@@ -14,12 +17,162 @@ from src.application.ports.calendar import (
     CalendarNotConnectedError,
 )
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
+from src.application.use_cases.process_message import ProcessMessageUseCase
+from src.domain.assistant.replies import AssistantReply, Confirmation
 from src.domain.calendar.models import CalendarEvent
 from src.infrastructure.telegram import calendar as calendar_handlers
 from src.infrastructure.telegram import handlers as common_handlers
+from src.infrastructure.telegram.commands import configure_commands
 
 Handler = Callable[[Any], Coroutine[Any, Any, None]]
 FIXED_NOW = datetime(2026, 9, 3, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [42, 99, None])
+async def test_removed_profile_command_never_reaches_llm(user_id: int | None) -> None:
+    process = SimpleNamespace(execute=AsyncMock())
+    router = common_handlers.create_router(
+        process_message=process,  # type: ignore[arg-type]
+        timezone="UTC",
+        allowed_user_id=42,
+    )
+    message = AsyncMock(spec=Message)
+    message.answer = AsyncMock()
+    message.text = "/profile"
+    message.from_user = SimpleNamespace(id=user_id) if user_id is not None else None
+    await router.propagate_event(
+        update_type="message", event=message, bot=AsyncMock(spec=Bot)
+    )
+    process.execute.assert_not_awaited()
+    if user_id == 42:
+        assert "меню" in message.answer.call_args.args[0]
+    else:
+        message.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_menu_api_failure_does_not_abort_startup() -> None:
+    bot = AsyncMock(spec=Bot)
+    bot.set_my_commands.side_effect = TelegramBadRequest(
+        method=SetMyCommands(commands=[]), message="temporarily unavailable"
+    )
+    await configure_commands(bot)
+    bot.set_chat_menu_button.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_text_handler_sends_inline_delete_and_cancel_buttons() -> None:
+    process_message = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=AssistantReply(
+                text="",
+                confirmations=(
+                    Confirmation(
+                        text="Удалить задачу ENG-1?", operation_id="opaque-token"
+                    ),
+                ),
+            )
+        )
+    )
+    router = common_handlers.create_router(
+        process_message=cast(ProcessMessageUseCase, process_message),
+        timezone="Europe/Moscow",
+        allowed_user_id=42,
+    )
+    message = FakeMessage(text="Удали все задачи в Linear")
+    await find_handler(router, "message", "text_handler")(message)
+    keyboard = message.answers[0][1]["reply_markup"]
+    buttons = keyboard.inline_keyboard[0]
+    assert [b.callback_data for b in buttons] == [
+        "delyes:opaque-token",
+        "delno:opaque-token",
+    ]
+    assert "Удалить" in buttons[0].text
+    assert buttons[1].text == "Отмена"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirm", [True, False])
+async def test_deletion_callback_resolves_button_and_removes_keyboard(
+    confirm: bool,
+) -> None:
+    process_message = SimpleNamespace(
+        resolve_deletion=AsyncMock(return_value="Удалено" if confirm else "Отменено")
+    )
+    router = common_handlers.create_router(
+        process_message=cast(ProcessMessageUseCase, process_message),
+        timezone="Europe/Moscow",
+        allowed_user_id=42,
+    )
+    message = AsyncMock(spec=Message)
+    message.answer = AsyncMock()
+    message.edit_reply_markup = AsyncMock()
+    callback = FakeCallback(
+        data=f"{'delyes' if confirm else 'delno'}:token", message=message
+    )
+    await find_handler(router, "callback_query", "deletion_callback")(callback)
+    assert callback.answers == [None]
+    process_message.resolve_deletion.assert_awaited_once_with(
+        user_id=42, operation_id="token", confirm=confirm
+    )
+    message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    message.answer.assert_awaited_once_with("Удалено" if confirm else "Отменено")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("user_id", "data"), [(99, "delyes:token"), (42, None)])
+async def test_deletion_callback_rejects_other_users_and_missing_data(
+    user_id: int, data: str | None
+) -> None:
+    process_message = SimpleNamespace(resolve_deletion=AsyncMock())
+    router = common_handlers.create_router(
+        process_message=cast(ProcessMessageUseCase, process_message),
+        timezone="Europe/Moscow",
+        allowed_user_id=42,
+    )
+    await find_handler(router, "callback_query", "deletion_callback")(
+        FakeCallback(data=data, user_id=user_id)
+    )
+    process_message.resolve_deletion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deletion_callback_handles_storage_and_keyboard_errors() -> None:
+    process_message = SimpleNamespace(
+        resolve_deletion=AsyncMock(side_effect=RuntimeError("private details"))
+    )
+    router = common_handlers.create_router(
+        process_message=cast(ProcessMessageUseCase, process_message),
+        timezone="Europe/Moscow",
+        allowed_user_id=42,
+    )
+    message = AsyncMock(spec=Message)
+    message.answer = AsyncMock()
+    message.edit_reply_markup = AsyncMock()
+    message.edit_reply_markup.side_effect = TelegramBadRequest(
+        method=EditMessageReplyMarkup(), message="already changed"
+    )
+    callback = FakeCallback(data="delyes:token", message=message)
+    await find_handler(router, "callback_query", "deletion_callback")(callback)
+    assert "Не удалось" in message.answer.await_args.args[0]
+    assert "private details" not in message.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_deletion_callback_without_message_still_acknowledged() -> None:
+    process_message = SimpleNamespace(
+        resolve_deletion=AsyncMock(return_value="Удалено")
+    )
+    router = common_handlers.create_router(
+        process_message=cast(ProcessMessageUseCase, process_message),
+        timezone="Europe/Moscow",
+        allowed_user_id=42,
+    )
+    callback = FakeCallback(data="delyes:token")
+    await find_handler(router, "callback_query", "deletion_callback")(callback)
+    assert callback.answers == [None]
+    process_message.resolve_deletion.assert_awaited_once()
 
 
 class FixedClock:
@@ -357,7 +510,10 @@ async def test_calendar_list_shows_events_with_server_verified_action_buttons(
         payloads=[{"event_id": "event-1"}],
     )
     text, kwargs = message.answers[0]
-    assert text == "📅 Ближайшие события:\n• 04.09 15:30 — Очень важная встреча"
+    assert text == (
+        "📅 Ближайшие события Google Calendar (до 10):\n"
+        "• 04.09.2026 15:30 MSK — Очень важная встреча"
+    )
     keyboard = kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].callback_data == "caledit:selection-1"
     assert keyboard.inline_keyboard[0][1].callback_data == "caldel:selection-1"

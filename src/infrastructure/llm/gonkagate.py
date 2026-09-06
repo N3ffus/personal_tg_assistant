@@ -4,8 +4,15 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from src.domain.assistant.business import BusinessDecision
+from src.domain.assistant.context import ContextMessage
 from src.domain.assistant.models import AssistantDecision
-from src.infrastructure.llm.openai import SYSTEM_PROMPT
+from src.infrastructure.llm.business import business_input, business_instructions
+from src.infrastructure.llm.openai import (
+    SUMMARY_PROMPT,
+    SYSTEM_PROMPT,
+    message_with_context,
+)
 
 
 class GonkaGateLLMClient:
@@ -28,6 +35,7 @@ class GonkaGateLLMClient:
         text: str,
         now: datetime,
         timezone: str,
+        context: str = "",
     ) -> AssistantDecision:
         instructions = (
             f"{SYSTEM_PROMPT}\n\n"
@@ -40,10 +48,14 @@ class GonkaGateLLMClient:
             'Пример create_event: {"actions":[{"type":"create_event",'
             '"title":"Стоматолог","starts_at":"2026-08-13T15:00:00+03:00"}]}\n'
             'Пример list_events: {"actions":[{"type":"list_events"}]}\n'
+            'Пример list_tasks: {"actions":[{"type":"list_tasks"}]}\n'
             'Пример update_event: {"actions":[{"type":"update_event",'
             '"title":"Стоматолог","starts_at":"2026-08-14T16:00:00+03:00"}]}\n'
             'Пример delete_event: {"actions":[{"type":"delete_event",'
             '"title":"Стоматолог"}]}\n'
+            'Пример delete_task: {"actions":[{"type":"delete_task","title":"ENG-42"}]}\n'
+            'Пример delete_all_tasks: {"actions":[{"type":"delete_all_tasks"}]}\n'
+            'Пример delete_all_events: {"actions":[{"type":"delete_all_events"}]}\n'
             'Пример save_note: {"actions":[{"type":"save_note",'
             '"text":"Люблю Python"}]}\n'
             f"Текущее время: {now.isoformat()}\n"
@@ -54,7 +66,7 @@ class GonkaGateLLMClient:
             model=self._model,
             messages=[
                 {"role": "system", "content": instructions},
-                {"role": "user", "content": text},
+                {"role": "user", "content": message_with_context(text, context)},
             ],
             response_format={"type": "json_object"},
         )
@@ -90,3 +102,51 @@ class GonkaGateLLMClient:
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def parse_business_dialog(
+        self,
+        *,
+        history: list[ContextMessage],
+        interlocutor: str,
+        owner_id: int,
+        last_processed_message_id: int,
+        now: datetime,
+        timezone: str,
+    ) -> BusinessDecision:
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": business_instructions(now=now, timezone=timezone)
+                    + "\nJSON schema: "
+                    + json.dumps(BusinessDecision.model_json_schema()),
+                },
+                {
+                    "role": "user",
+                    "content": business_input(
+                        history=history,
+                        interlocutor=interlocutor,
+                        owner_id=owner_id,
+                        last_processed_message_id=last_processed_message_id,
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        if not response.choices or not response.choices[0].message.content:
+            raise RuntimeError("LLM returned no business decision")
+        return BusinessDecision.model_validate_json(response.choices[0].message.content)
+
+    async def summarize(self, *, text: str) -> str:
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": SUMMARY_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            max_completion_tokens=4096,
+        )
+        if not response.choices or not response.choices[0].message.content:
+            raise RuntimeError("LLM returned an empty summary")
+        return response.choices[0].message.content

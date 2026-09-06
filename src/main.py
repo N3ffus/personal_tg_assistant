@@ -7,6 +7,8 @@ from aiogram import Bot, Dispatcher
 from src.application.services.action_executor import (
     ActionExecutor,
 )
+from src.application.services.context import ContextService
+from src.application.use_cases.process_business_dialog import ProcessBusinessDialog
 from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
 )
@@ -14,12 +16,20 @@ from src.config import Settings
 from src.infrastructure.calendar.google import GoogleCalendarClient
 from src.infrastructure.calendar.oauth import GoogleOAuthService, create_oauth_app
 from src.infrastructure.calendar.storage import CalendarStorage
+from src.infrastructure.context.business_storage import BusinessStorage
+from src.infrastructure.context.storage import ContextStorage
 from src.infrastructure.llm.gonkagate import (
     GonkaGateLLMClient,
 )
 from src.infrastructure.tasks.linear import LinearTaskClient
 from src.infrastructure.telegram.business import create_business_router
+from src.infrastructure.telegram.business_worker import (
+    BusinessDialogWorker,
+    OwnerBusinessNotifier,
+)
 from src.infrastructure.telegram.calendar import create_calendar_router
+from src.infrastructure.telegram.commands import configure_commands
+from src.infrastructure.telegram.context import create_context_router
 from src.infrastructure.telegram.handlers import (
     create_router,
 )
@@ -67,12 +77,19 @@ async def main() -> None:
     )
     task_tracker: LinearTaskClient | None = None
     bot: Bot | None = None
+    business_worker: BusinessDialogWorker | None = None
     try:
         storage = CalendarStorage(
             database_path=settings.database_path,
             encryption_key=settings.google_token_encryption_key.get_secret_value(),
         )
         await storage.initialize()
+        context_storage = ContextStorage(
+            database_path=settings.database_path,
+            encryption_key=settings.google_token_encryption_key.get_secret_value(),
+        )
+        await context_storage.initialize()
+        contexts = ContextService(storage=context_storage, summarizer=llm)
         calendar = GoogleCalendarClient(storage=storage)
         oauth = GoogleOAuthService(
             storage=storage,
@@ -91,15 +108,38 @@ async def main() -> None:
             task_tracker=task_tracker,
         )
 
+        bot = Bot(token=settings.telegram_bot_token.get_secret_value())
+        business_storage = BusinessStorage(
+            database_path=settings.database_path,
+            encryption_key=settings.google_token_encryption_key.get_secret_value(),
+        )
+        await business_storage.initialize()
+        business_worker = BusinessDialogWorker(
+            processor=ProcessBusinessDialog(
+                contexts=contexts,
+                storage=business_storage,
+                llm=llm,
+                executor=action_executor,
+                owner_id=settings.telegram_allowed_user_id,
+                timezone=settings.app_timezone,
+                notify=OwnerBusinessNotifier(
+                    bot=bot, owner_id=settings.telegram_allowed_user_id
+                ),
+            )
+        )
+
         process_message = ProcessMessageUseCase(
             llm=llm,
             action_executor=action_executor,
+            contexts=contexts,
         )
 
         dispatcher = Dispatcher()
         dispatcher.include_router(
             create_business_router(
                 allowed_user_id=settings.telegram_allowed_user_id,
+                contexts=contexts,
+                extractor=business_worker,
             )
         )
         dispatcher.include_router(
@@ -112,15 +152,22 @@ async def main() -> None:
             )
         )
         dispatcher.include_router(
+            create_context_router(
+                contexts=contexts, allowed_user_id=settings.telegram_allowed_user_id
+            )
+        )
+        dispatcher.include_router(
             create_router(
                 process_message=process_message,
                 timezone=settings.app_timezone,
                 allowed_user_id=settings.telegram_allowed_user_id,
+                contexts=contexts,
             )
         )
 
-        bot = Bot(
-            token=settings.telegram_bot_token.get_secret_value(),
+        await configure_commands(bot)
+        await business_worker.resume(
+            contexts=contexts, owner_id=settings.telegram_allowed_user_id
         )
 
         server = uvicorn.Server(
@@ -134,6 +181,8 @@ async def main() -> None:
         )
         await _run_services(dispatcher=dispatcher, bot=bot, server=server)
     finally:
+        if business_worker is not None:
+            await business_worker.close()
         try:
             if task_tracker is not None:
                 await task_tracker.close()

@@ -32,7 +32,16 @@ def assert_contract(
         while action_index < len(run.decision.actions):
             action = run.decision.actions[action_index]
             action_index += 1
-            if call.name.rsplit(".", 1)[1] == action.type.value:
+            deletion_calls = {
+                "delete_task": "linear.find_tasks",
+                "delete_all_tasks": "linear.find_tasks",
+                "delete_event": "calendar.find_events",
+                "delete_all_events": "calendar.find_events",
+            }
+            if (
+                call.name.rsplit(".", 1)[1] == action.type.value
+                or deletion_calls.get(action.type.value) == call.name
+            ):
                 data = action.model_dump(mode="json")
                 for key in ("title", "starts_at"):
                     if key in data:

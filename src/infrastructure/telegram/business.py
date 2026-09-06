@@ -5,11 +5,20 @@ from aiogram import Bot, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BusinessConnection, Message
 
+from src.application.services.context import ContextService
+from src.domain.assistant.context import ContextMessage
+from src.infrastructure.telegram.business_worker import BusinessDialogWorker
+
 logger = logging.getLogger(__name__)
 REJECTED_CONNECTION_LIMIT = 128
 
 
-def create_business_router(*, allowed_user_id: int) -> Router:
+def create_business_router(
+    *,
+    allowed_user_id: int,
+    contexts: ContextService | None = None,
+    extractor: BusinessDialogWorker | None = None,
+) -> Router:
     router = Router(name=__name__)
     connections: dict[str, BusinessConnection] = {}
     connection_loads: dict[str, asyncio.Task[BusinessConnection]] = {}
@@ -94,6 +103,55 @@ def create_business_router(*, allowed_user_id: int) -> Router:
         connection = await load_connection(connection_id, bot)
         if connection is None:
             return
+
+        if contexts is not None and (message.text or message.caption):
+            title = message.chat.title or message.chat.full_name or str(message.chat.id)
+            if message.chat.username:
+                title += f" (@{message.chat.username})"
+            sender = (
+                "Бизнес-бот"
+                if message.sender_business_bot is not None
+                else "Вы"
+                if message.from_user is not None
+                and message.from_user.id == allowed_user_id
+                else message.from_user.full_name
+                if message.from_user is not None
+                else title
+            )
+            try:
+                chat = await contexts.ensure_chat(
+                    owner_id=allowed_user_id,
+                    kind="business",
+                    chat_id=message.chat.id,
+                    title=title,
+                )
+                await contexts.record(
+                    owner_id=allowed_user_id,
+                    context_id=chat.id,
+                    message=ContextMessage(
+                        role="user",
+                        sender=sender,
+                        text=message.text or message.caption or "",
+                        sent_at=message.date,
+                        message_id=message.message_id,
+                        reply_to_message_id=(
+                            message.reply_to_message.message_id
+                            if message.reply_to_message is not None
+                            else None
+                        ),
+                        sender_id=message.from_user.id if message.from_user else None,
+                        is_business_bot=message.sender_business_bot is not None,
+                        is_forwarded=message.forward_origin is not None,
+                    ),
+                )
+                if (
+                    extractor is not None
+                    and message.sender_business_bot is None
+                    and message.from_user is not None
+                ):
+                    extractor.submit(chat)
+            except Exception:
+                logger.exception("Failed to store Telegram Business context")
 
         if message.sender_business_bot is not None:
             return

@@ -20,6 +20,107 @@ from src.infrastructure.calendar import google as google_module
 from src.infrastructure.calendar.google import GoogleCalendarClient
 
 
+@pytest.mark.asyncio
+async def test_find_events_reads_all_pages_including_all_day_and_recurring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    page_request = Mock(
+        side_effect=[
+            FakeRequest(
+                result={
+                    "items": [
+                        google_event(),
+                        {"id": "cancelled", "status": "cancelled"},
+                    ],
+                    "nextPageToken": "next",
+                }
+            ),
+            FakeRequest(
+                result={
+                    "items": [
+                        {
+                            "id": "all-day",
+                            "summary": "Holiday",
+                            "start": {"date": "2026-09-05"},
+                        },
+                        {
+                            **google_event(event_id="series"),
+                            "recurrence": ["RRULE:FREQ=DAILY"],
+                        },
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(events, "list", page_request)
+    targets = await client.find_events(user_id=42, title=None)
+    assert [t.id for t in targets] == ["event-1", "all-day", "series"]
+    assert "весь день" in targets[1].label
+    assert "вся повторяющаяся серия" in targets[2].label
+    assert [c.kwargs["pageToken"] for c in page_request.call_args_list] == [
+        None,
+        "next",
+    ]
+    for args in page_request.call_args_list:
+        assert args.kwargs["singleEvents"] is False
+        assert args.kwargs["calendarId"] == "primary"
+        assert "timeMin" not in args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_find_events_matches_title_without_matching_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    events.requests["list"] = FakeRequest(
+        result={
+            "items": [
+                google_event(title="Встреча команды"),
+                {
+                    **google_event(event_id="other", title="Другое"),
+                    "description": "встреча",
+                },
+            ]
+        }
+    )
+    targets = await client.find_events(user_id=42, title="ВСТРЕЧА")
+    assert [t.id for t in targets] == ["event-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"items": {}},
+        {"items": [None]},
+        {"items": [{"id": "id", "start": {}}]},
+        {"items": [{"id": "id", "start": {"date": "invalid"}}]},
+        {"items": [{"start": {"date": "2026-09-05"}}]},
+        {"items": [], "nextPageToken": 123},
+        {"items": [], "nextPageToken": "same"},
+    ],
+)
+async def test_find_events_fails_closed_on_incomplete_data(
+    monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    events.requests["list"] = FakeRequest(result=payload)
+    with pytest.raises(CalendarError):
+        await client.find_events(user_id=42, title=None)
+
+
+@pytest.mark.asyncio
+async def test_find_events_blank_query_must_not_list_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    with pytest.raises(CalendarError):
+        await client.find_events(user_id=42, title=" ")
+    assert events.calls == []
+
+
 class FakeStorage:
     def __init__(self, credentials: dict[str, object] | None) -> None:
         self.credentials = credentials
@@ -39,6 +140,83 @@ class FakeStorage:
 
     async def delete_connection(self, *, user_id: int) -> None:
         self.deleted.append(user_id)
+
+
+@pytest.mark.asyncio
+async def test_upcoming_events_follow_empty_pages_and_stop_after_ten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    pages = Mock(
+        side_effect=[
+            FakeRequest(
+                result={
+                    "items": [{"id": "cancelled", "status": "cancelled"}],
+                    "nextPageToken": "page-2",
+                }
+            ),
+            FakeRequest(
+                result={
+                    "items": [google_event(event_id="first")],
+                    "nextPageToken": "page-3",
+                }
+            ),
+            FakeRequest(
+                result={
+                    "items": [google_event(event_id=f"event-{i}") for i in range(9)],
+                    "nextPageToken": "more",
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(events, "list", pages)
+    result = await client.list_events(user_id=42, now=datetime(2026, 9, 3, tzinfo=UTC))
+    assert len(result) == 10
+    assert result[0].event_id == "first"
+    assert [c.kwargs["maxResults"] for c in pages.call_args_list] == [10, 10, 9]
+    assert [c.kwargs.get("pageToken") for c in pages.call_args_list] == [
+        None,
+        "page-2",
+        "page-3",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["", 123, "repeated"])
+async def test_upcoming_events_reject_invalid_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+    token: object,
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    events.requests["list"] = FakeRequest(result={"items": [], "nextPageToken": token})
+    with pytest.raises(CalendarError, match="pagination"):
+        await client.list_events(user_id=42, now=datetime.now(UTC))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ({"date": "invalid"}, {"date": "2026-09-07"}),
+        ({"date": "2026-09-06"}, {"date": "2026-09-06"}),
+        ({"dateTime": "2026-09-06T12:00:00"}, {"dateTime": "2026-09-06T13:00:00"}),
+        (
+            {"dateTime": "2026-09-06T12:00:00+03:00"},
+            {"dateTime": "2026-09-06T11:00:00+03:00"},
+        ),
+    ],
+)
+async def test_upcoming_events_reject_invalid_dates(
+    monkeypatch: pytest.MonkeyPatch,
+    start: dict[str, str],
+    end: dict[str, str],
+) -> None:
+    client, _, _, events = connected_client(monkeypatch)
+    events.requests["list"] = FakeRequest(
+        result={"items": [{**google_event(), "start": start, "end": end}]}
+    )
+    with pytest.raises(CalendarError, match="event time"):
+        await client.list_events(user_id=42, now=datetime.now(UTC))
 
 
 class FakeCredentials:
@@ -383,7 +561,7 @@ async def test_naive_event_time_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_all_day_events_are_skipped(
+async def test_all_day_events_are_included(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = FakeEventsResource()
@@ -403,7 +581,11 @@ async def test_all_day_events_are_skipped(
 
     result = await client.list_events(user_id=42, now=datetime.now(UTC))
 
-    assert result == []
+    assert len(result) == 1
+    assert result[0].title == "Holiday"
+    assert result[0].all_day is True
+    assert result[0].starts_at == datetime(2026, 9, 3, tzinfo=UTC)
+    assert result[0].ends_at == datetime(2026, 9, 4, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
@@ -420,7 +602,7 @@ async def test_event_without_summary_uses_readable_fallback(
 
 
 @pytest.mark.asyncio
-async def test_list_events_skips_record_without_timed_end(
+async def test_list_events_rejects_inconsistent_timed_and_all_day_dates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events = FakeEventsResource()
@@ -437,9 +619,8 @@ async def test_list_events_skips_record_without_timed_end(
     )
     client, _, _, _ = connected_client(monkeypatch, events=events)
 
-    result = await client.list_events(user_id=42, now=datetime.now(UTC))
-
-    assert result == []
+    with pytest.raises(CalendarError, match="event time"):
+        await client.list_events(user_id=42, now=datetime.now(UTC))
 
 
 @pytest.mark.asyncio

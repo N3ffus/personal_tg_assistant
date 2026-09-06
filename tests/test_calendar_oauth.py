@@ -1,13 +1,20 @@
+import hashlib
 import json
+from base64 import urlsafe_b64encode
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+import requests
+from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
 
 from src.infrastructure.calendar.google import SCOPES
 from src.infrastructure.calendar.oauth import GoogleOAuthService, create_oauth_app
+from src.infrastructure.calendar.storage import CalendarStorage
 
 
 def oauth_service(storage: object) -> GoogleOAuthService:
@@ -17,6 +24,69 @@ def oauth_service(storage: object) -> GoogleOAuthService:
         client_secret="client-secret",
         redirect_uri="https://assistant.example/oauth/google/callback",
     )
+
+
+@pytest.mark.asyncio
+async def test_pkce_verifier_survives_restart_and_matches_authorization_challenge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = str(tmp_path / "calendar.db")
+    encryption_key = Fernet.generate_key().decode()
+    storage = CalendarStorage(
+        database_path=database_path, encryption_key=encryption_key
+    )
+    await storage.initialize()
+    url = await oauth_service(storage).authorization_url(user_id=42)
+    query = parse_qs(urlsplit(url).query)
+    assert query["code_challenge_method"] == ["S256"]
+
+    def exchange(
+        session: requests.Session,
+        request: requests.PreparedRequest,
+        **kwargs: object,
+    ) -> requests.Response:
+        assert request.url == "https://oauth2.googleapis.com/token"
+        assert isinstance(request.body, str)
+        body = parse_qs(request.body)
+        verifier = body.get("code_verifier", [""])[0]
+        assert 43 <= len(verifier) <= 128, "Token request is missing the PKCE verifier"
+        challenge = urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        assert challenge.decode().rstrip("=") == query["code_challenge"][0]
+        assert verifier not in url
+        assert body["code"] == ["authorization-code"]
+        response = requests.Response()
+        response.request = request
+        response.status_code = 200
+        response._content = json.dumps(
+            {
+                "access_token": "test-access-token",
+                "refresh_token": "test-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": " ".join(SCOPES),
+            }
+        ).encode()
+        return response
+
+    send = Mock(side_effect=exchange)
+    monkeypatch.setattr(
+        requests.Session, "send", lambda self, request, **kw: send(self, request, **kw)
+    )
+    restarted_storage = CalendarStorage(
+        database_path=database_path, encryption_key=encryption_key
+    )
+    await restarted_storage.initialize()
+    restarted_service = oauth_service(restarted_storage)
+    assert await restarted_service.complete(
+        code="authorization-code", state=query["state"][0]
+    )
+    credentials = await restarted_storage.load_credentials(user_id=42)
+    assert credentials is not None
+    assert credentials["refresh_token"] == "test-refresh-token"
+    assert not await restarted_service.complete(
+        code="authorization-code", state=query["state"][0]
+    )
+    assert send.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -35,7 +105,11 @@ async def test_authorization_url_binds_google_state_to_telegram_user(
     result = await oauth_service(storage).authorization_url(user_id=42)
 
     assert result == "https://accounts.google.test/authorize"
-    storage.create_oauth_state.assert_awaited_once_with(user_id=42)
+    verifier = storage.create_oauth_state.call_args.kwargs["code_verifier"]
+    assert 43 <= len(verifier) <= 128
+    storage.create_oauth_state.assert_awaited_once_with(
+        user_id=42, code_verifier=verifier
+    )
     flow.authorization_url.assert_called_once_with(
         access_type="offline",
         include_granted_scopes="true",
@@ -54,6 +128,8 @@ async def test_authorization_url_binds_google_state_to_telegram_user(
         "scopes": SCOPES,
         "redirect_uri": "https://assistant.example/oauth/google/callback",
         "state": None,
+        "code_verifier": verifier,
+        "autogenerate_code_verifier": False,
     }
 
 
@@ -81,7 +157,7 @@ async def test_complete_exchanges_code_and_persists_full_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = SimpleNamespace(
-        consume_oauth_state=AsyncMock(return_value=42),
+        consume_oauth_state=AsyncMock(return_value=(42, "saved-verifier")),
         save_credentials=AsyncMock(),
     )
     payload = {
@@ -108,6 +184,7 @@ async def test_complete_exchanges_code_and_persists_full_credentials(
     assert completed is True
     flow.fetch_token.assert_called_once_with(code="authorization-code")
     assert from_client_config.call_args.kwargs["state"] == "state-123"
+    assert from_client_config.call_args.kwargs["code_verifier"] == "saved-verifier"
     storage.save_credentials.assert_awaited_once_with(
         user_id=42,
         credentials=payload,
@@ -119,7 +196,7 @@ async def test_complete_rejects_non_object_credentials_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage = SimpleNamespace(
-        consume_oauth_state=AsyncMock(return_value=42),
+        consume_oauth_state=AsyncMock(return_value=(42, "saved-verifier")),
         save_credentials=AsyncMock(),
     )
     flow = SimpleNamespace(
