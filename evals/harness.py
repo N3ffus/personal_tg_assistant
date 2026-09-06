@@ -14,6 +14,7 @@ from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.deletions import DeletionTarget
 from src.domain.assistant.models import AssistantDecision
 from src.domain.assistant.replies import AssistantReply
+from src.domain.assistant.retrieval import EventQuery, TaskQuery
 from src.domain.calendar.models import CalendarEvent
 from src.domain.tasks.models import CreatedTask, Task
 
@@ -84,7 +85,7 @@ class RecordingIntegrations:
     ) -> tuple[str, dict[str, object]] | None:
         raise AssertionError("Natural-language input must not consume confirmations")
 
-    async def list_tasks(self) -> list[Task]:
+    async def list_tasks(self, *, query: TaskQuery | None = None) -> list[Task]:
         self.calls.append(RecordedCall("linear.list_tasks", {}))
         if self.scenario.failure == "linear_error":
             self.calls[-1].error = "TaskTrackerError"
@@ -163,7 +164,9 @@ class RecordingIntegrations:
         self.calls[-1].output = self._event_data(event)
         return event
 
-    async def list_events(self, *, user_id: int, now: datetime) -> list[CalendarEvent]:
+    async def list_events(
+        self, *, user_id: int, now: datetime, query: EventQuery | None = None
+    ) -> list[CalendarEvent]:
         self.calls.append(
             RecordedCall(
                 "calendar.list_events", {"user_id": user_id, "now": now.isoformat()}
@@ -265,5 +268,11 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
     )
     assert decision is not None
     if isinstance(reply, AssistantReply):
-        reply = "\n\n".join([reply.text, *(c.text for c in reply.confirmations)])
+        reply = "\n\n".join(
+            [
+                reply.text,
+                *(c.text for c in reply.confirmations),
+                *(p.text for p in reply.pages),
+            ]
+        )
     return EvaluationRun(decision, integrations.calls, reply)

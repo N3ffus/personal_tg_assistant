@@ -1,6 +1,11 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+)
 
-from src.domain.assistant.replies import AssistantReply
+from src.domain.assistant.replies import AssistantReply, ResultPage
 
 TELEGRAM_TEXT_LIMIT = 4096
 
@@ -11,6 +16,8 @@ async def answer_reply(message: Message, reply: str | AssistantReply) -> None:
         return
     if reply.text:
         await answer_text(message, reply.text)
+    for page in reply.pages:
+        await answer_page(message, page)
     for confirmation in reply.confirmations:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -27,6 +34,30 @@ async def answer_reply(message: Message, reply: str | AssistantReply) -> None:
             ]
         )
         await answer_text(message, confirmation.text, reply_markup=keyboard)
+
+
+def page_keyboard(page: ResultPage) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=b.text, callback_data=b.callback_data)
+                for b in row
+            ]
+            for row in page.buttons
+        ]
+    )
+
+
+async def answer_page(
+    message: Message, page: ResultPage, *, edit: bool = False
+) -> None:
+    send = message.edit_text if edit else message.answer
+    await send(
+        page.text,
+        parse_mode="HTML",
+        reply_markup=page_keyboard(page),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 
 async def answer_text(

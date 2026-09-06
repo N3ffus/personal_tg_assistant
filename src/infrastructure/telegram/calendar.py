@@ -1,6 +1,4 @@
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -15,13 +13,10 @@ from src.application.ports.calendar import (
     CalendarClient,
     CalendarError,
     CalendarEventNotFoundError,
-    CalendarNotConnectedError,
 )
-from src.application.services.action_executor import ActionExecutor
 from src.domain.calendar.models import CalendarEvent
 from src.infrastructure.calendar.oauth import GoogleOAuthService
 from src.infrastructure.calendar.storage import CalendarStorage
-from src.infrastructure.telegram.replies import answer_text
 
 logger = logging.getLogger(__name__)
 
@@ -60,44 +55,6 @@ def create_calendar_router(
             await message.answer("Не удалось отключить Google Calendar.")
             return
         await message.answer("Google Calendar отключён.")
-
-    @router.message(Command("calendar"))
-    async def list_events(message: Message) -> None:
-        user_id = _allowed_message_user_id(message, allowed_user_id)
-        if user_id is None:
-            return
-        try:
-            events = await calendar.list_events(
-                user_id=user_id,
-                now=datetime.now(ZoneInfo(timezone)),
-            )
-        except CalendarNotConnectedError:
-            await message.answer("Подключите календарь командой /calendar_connect.")
-            return
-        except CalendarError:
-            await message.answer("Google Calendar временно недоступен.")
-            return
-        try:
-            selection_ids = (
-                await storage.create_operations(
-                    user_id=user_id,
-                    kind="select",
-                    payloads=[{"event_id": event.event_id} for event in events],
-                )
-                if events
-                else []
-            )
-        except Exception:
-            logger.exception("Failed to store calendar event selections")
-            await message.answer("Не удалось подготовить действия с событиями.")
-            return
-        await answer_text(
-            message,
-            ActionExecutor.format_events(events, timezone=ZoneInfo(timezone)),
-            reply_markup=(
-                _event_keyboard(events, selection_ids) if selection_ids else None
-            ),
-        )
 
     @router.callback_query(F.data.startswith("caledit:"))
     async def request_update(callback: CallbackQuery) -> None:

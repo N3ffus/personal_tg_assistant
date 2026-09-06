@@ -1,5 +1,5 @@
 from collections.abc import Callable, Coroutine
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime, tzinfo
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -14,12 +14,10 @@ from aiogram.types import Message
 from src.application.ports.calendar import (
     CalendarError,
     CalendarEventNotFoundError,
-    CalendarNotConnectedError,
 )
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.replies import AssistantReply, Confirmation
-from src.domain.calendar.models import CalendarEvent
 from src.infrastructure.telegram import calendar as calendar_handlers
 from src.infrastructure.telegram import handlers as common_handlers
 from src.infrastructure.telegram.commands import configure_commands
@@ -466,7 +464,7 @@ async def test_calendar_disconnect_reports_expected_failure() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("handler_name", ["disconnect", "list_events"])
+@pytest.mark.parametrize("handler_name", ["disconnect"])
 async def test_calendar_command_ignores_channel_post_without_user(
     handler_name: str,
 ) -> None:
@@ -478,85 +476,6 @@ async def test_calendar_command_ignores_channel_post_without_user(
     calendar.disconnect.assert_not_awaited()
     calendar.list_events.assert_not_awaited()
     assert message.answers == []
-
-
-@pytest.mark.asyncio
-async def test_calendar_list_shows_events_with_server_verified_action_buttons(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(calendar_handlers, "datetime", FixedClock)
-    starts_at = datetime(2026, 9, 4, 15, 30, tzinfo=ZoneInfo("Europe/Moscow"))
-    event = CalendarEvent(
-        event_id="event-1",
-        title="Очень важная встреча",
-        starts_at=starts_at,
-        ends_at=starts_at + timedelta(hours=1),
-        html_link=None,
-    )
-    calendar = SimpleNamespace(
-        list_events=AsyncMock(return_value=[event]),
-        disconnect=AsyncMock(),
-        delete_event=AsyncMock(),
-    )
-    router, _, _, storage = calendar_router(calendar=calendar)
-    message = FakeMessage()
-
-    await find_handler(router, "message", "list_events")(message)
-
-    calendar.list_events.assert_awaited_once_with(user_id=42, now=FIXED_NOW)
-    storage.create_operations.assert_awaited_once_with(
-        user_id=42,
-        kind="select",
-        payloads=[{"event_id": "event-1"}],
-    )
-    text, kwargs = message.answers[0]
-    assert text == (
-        "📅 Ближайшие события Google Calendar (до 10):\n"
-        "• 04.09.2026 15:30 MSK — Очень важная встреча"
-    )
-    keyboard = kwargs["reply_markup"]
-    assert keyboard.inline_keyboard[0][0].callback_data == "caledit:selection-1"
-    assert keyboard.inline_keyboard[0][1].callback_data == "caldel:selection-1"
-
-
-@pytest.mark.asyncio
-async def test_calendar_list_omits_keyboard_when_empty() -> None:
-    router, calendar, _, storage = calendar_router()
-    message = FakeMessage()
-
-    await find_handler(router, "message", "list_events")(message)
-
-    calendar.list_events.assert_awaited_once()
-    storage.create_operations.assert_not_awaited()
-    assert message.answers == [("Ближайших событий не найдено.", {})]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (
-            CalendarNotConnectedError(),
-            "Подключите календарь командой /calendar_connect.",
-        ),
-        (CalendarError(), "Google Calendar временно недоступен."),
-    ],
-)
-async def test_calendar_list_distinguishes_connection_and_api_errors(
-    error: CalendarError,
-    expected: str,
-) -> None:
-    calendar = SimpleNamespace(
-        list_events=AsyncMock(side_effect=error),
-        disconnect=AsyncMock(),
-        delete_event=AsyncMock(),
-    )
-    router, _, _, _ = calendar_router(calendar=calendar)
-    message = FakeMessage()
-
-    await find_handler(router, "message", "list_events")(message)
-
-    assert message.answers == [(expected, {})]
 
 
 @pytest.mark.asyncio
@@ -746,33 +665,7 @@ async def test_calendar_callbacks_ignore_missing_data(handler_name: str) -> None
 
 
 @pytest.mark.asyncio
-async def test_event_button_text_respects_telegram_limit() -> None:
-    starts_at = datetime(2026, 9, 4, tzinfo=ZoneInfo("Europe/Moscow"))
-    event = CalendarEvent(
-        event_id="event-1",
-        title="A" * 100,
-        starts_at=starts_at,
-        ends_at=starts_at + timedelta(hours=1),
-        html_link=None,
-    )
-
-    calendar = SimpleNamespace(
-        list_events=AsyncMock(return_value=[event]),
-        disconnect=AsyncMock(),
-        delete_event=AsyncMock(),
-    )
-    router, _, _, _ = calendar_router(calendar=calendar)
-    message = FakeMessage()
-
-    await find_handler(router, "message", "list_events")(message)
-
-    keyboard = message.answers[0][1]["reply_markup"]
-
-    assert all(len(button.text) <= 64 for button in keyboard.inline_keyboard[0])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("handler_name", ["connect", "disconnect", "list_events"])
+@pytest.mark.parametrize("handler_name", ["connect", "disconnect"])
 async def test_calendar_commands_ignore_users_outside_allowlist(
     handler_name: str,
 ) -> None:
@@ -832,35 +725,3 @@ async def test_calendar_selection_rejects_consumed_or_forged_token(
     storage.create_operation.assert_not_awaited()
     assert callback.answers == [None]
     assert message.answers == [("Кнопка недействительна или устарела.", {})]
-
-
-@pytest.mark.asyncio
-async def test_long_google_event_id_never_enters_telegram_callback_data() -> None:
-    starts_at = datetime(2026, 9, 4, tzinfo=ZoneInfo("Europe/Moscow"))
-    event_id = "a" * 1024
-    event = CalendarEvent(
-        event_id=event_id,
-        title="Planning",
-        starts_at=starts_at,
-        ends_at=starts_at + timedelta(hours=1),
-        html_link=None,
-    )
-    calendar = SimpleNamespace(
-        list_events=AsyncMock(return_value=[event]),
-        disconnect=AsyncMock(),
-        delete_event=AsyncMock(),
-    )
-    router, _, _, storage = calendar_router(calendar=calendar)
-    message = FakeMessage()
-
-    await find_handler(router, "message", "list_events")(message)
-
-    keyboard = message.answers[0][1]["reply_markup"]
-    callback_data = [button.callback_data for button in keyboard.inline_keyboard[0]]
-    assert callback_data == ["caledit:selection-1", "caldel:selection-1"]
-    assert all(data is not None and len(data.encode()) <= 64 for data in callback_data)
-    storage.create_operations.assert_awaited_once_with(
-        user_id=42,
-        kind="select",
-        payloads=[{"event_id": event_id}],
-    )

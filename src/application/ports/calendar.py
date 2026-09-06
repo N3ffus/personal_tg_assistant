@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Protocol
 
 from src.domain.assistant.deletions import DeletionTarget
+from src.domain.assistant.retrieval import EventQuery
 from src.domain.calendar.models import CalendarEvent
 
 
@@ -31,7 +32,7 @@ class CalendarClient(Protocol):
     ) -> CalendarEvent: ...
 
     async def list_events(
-        self, *, user_id: int, now: datetime
+        self, *, user_id: int, now: datetime, query: EventQuery | None = None
     ) -> list[CalendarEvent]: ...
 
     async def update_event(

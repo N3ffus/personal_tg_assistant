@@ -304,11 +304,13 @@ async def test_list_events_passes_current_time_and_formats_results() -> None:
 
     result = await executor.execute(action, user_id=42, now=NOW)
 
-    calendar.list_events.assert_awaited_once_with(user_id=42, now=NOW)
-    assert result == (
-        "📅 Ближайшие события Google Calendar (до 10):\n"
-        "• 04.09.2026 15:30 UTC — Стоматолог\nhttps://calendar.test/event-1"
-    )
+    calendar.list_events.assert_awaited_once()
+    assert calendar.list_events.call_args.kwargs["now"] == NOW
+    assert calendar.list_events.call_args.kwargs["query"].date_from == NOW
+    assert not isinstance(result, str)
+    assert "04.09.2026 15:30 UTC" in result.pages[0].text
+    assert "Стоматолог" in result.pages[0].text
+    assert "https://calendar.test/event-1" in result.pages[0].text
 
 
 @pytest.mark.asyncio
@@ -321,7 +323,8 @@ async def test_list_events_formats_empty_result() -> None:
         now=NOW,
     )
 
-    assert result == "Ближайших событий не найдено."
+    assert not isinstance(result, str)
+    assert "ничего не найдено" in result.pages[0].text
 
 
 @pytest.mark.asyncio

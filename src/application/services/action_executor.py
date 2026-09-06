@@ -14,6 +14,7 @@ from src.application.ports.tasks import (
     TaskTrackerError,
 )
 from src.application.services.deletions import DeletionService
+from src.application.services.retrieval import RetrievalService
 from src.domain.assistant.business import (
     BusinessAction,
     BusinessEvent,
@@ -34,7 +35,8 @@ from src.domain.assistant.models import (
     SaveNoteAction,
     UpdateEventAction,
 )
-from src.domain.assistant.replies import AssistantReply, Confirmation
+from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
+from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
 from src.domain.calendar.models import CalendarEvent
 from src.domain.tasks.models import Task
 
@@ -50,6 +52,9 @@ class ActionExecutor:
         self._calendar = calendar
         self._pending_operations = pending_operations
         self._task_tracker = task_tracker
+        self._retrieval = RetrievalService(
+            calendar=calendar, task_tracker=task_tracker, storage=pending_operations
+        )
         self._deletions = DeletionService(
             calendar=calendar, task_tracker=task_tracker, storage=pending_operations
         )
@@ -96,9 +101,14 @@ class ActionExecutor:
 
         responses: list[str] = []
         confirmations: list[Confirmation] = []
+        pages: list[ResultPage] = []
         for action in actions:
             try:
                 response = await self.execute(action, user_id=user_id, now=now)
+            except (RetrievalLimitError, TimeoutError):
+                if not isinstance(action, (ListTasksAction, ListEventsAction)):
+                    raise
+                response = "Выборка слишком большая или поиск занял слишком много времени. Уточните период, слово, проект или статус и повторите запрос."
             except TaskCreationUncertainError:
                 if not isinstance(action, CreateTaskAction):
                     raise
@@ -134,13 +144,16 @@ class ActionExecutor:
                 if response.text:
                     responses.append(response.text)
                 confirmations.extend(response.confirmations)
+                pages.extend(response.pages)
             else:
                 responses.append(response)
 
         text = "\n\n".join(responses)
         return (
-            AssistantReply(text=text, confirmations=tuple(confirmations))
-            if confirmations
+            AssistantReply(
+                text=text, confirmations=tuple(confirmations), pages=tuple(pages)
+            )
+            if confirmations or pages
             else text
         )
 
@@ -159,7 +172,9 @@ class ActionExecutor:
             return f"✅ Создана задача {task.identifier}: {task.title}\n{task.url}"
 
         if isinstance(action, ListTasksAction):
-            return self.format_tasks(await self._task_tracker.list_tasks())
+            query = TaskQuery.model_validate(action.model_dump(exclude={"type"}))
+            page = await self._retrieval.open(query=query, user_id=user_id, now=now)
+            return AssistantReply(text="", confirmations=(), pages=(page,))
 
         if isinstance(action, (DeleteTaskAction, DeleteAllTasksAction)):
             return await self._deletions.prepare(
@@ -177,8 +192,11 @@ class ActionExecutor:
             return self._event_result("Создано событие", event)
 
         if isinstance(action, ListEventsAction):
-            events = await self._calendar.list_events(user_id=user_id, now=now)
-            return self.format_events(events, timezone=now.tzinfo)
+            event_query = EventQuery.model_validate(action.model_dump(exclude={"type"}))
+            page = await self._retrieval.open(
+                query=event_query, user_id=user_id, now=now
+            )
+            return AssistantReply(text="", confirmations=(), pages=(page,))
 
         if isinstance(action, UpdateEventAction):
             payload = await self._pending_operations.consume_latest_operation(
@@ -217,6 +235,11 @@ class ActionExecutor:
                 f"• {task.identifier}: {task.title} — {task.status}\n{task.url}"
             )
         return "\n".join(lines)
+
+    async def browse(
+        self, *, user_id: int, data: str, now: datetime
+    ) -> ResultPage | str:
+        return await self._retrieval.navigate(user_id=user_id, data=data, now=now)
 
     @staticmethod
     def format_events(

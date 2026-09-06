@@ -14,6 +14,8 @@ from src.application.services.explicit_commands import parse_view_request
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import AssistantDecision, ListTasksAction
+from src.domain.assistant.replies import AssistantReply
+from src.domain.assistant.retrieval import EventQuery, TaskQuery
 from src.domain.calendar.models import CalendarEvent
 from src.domain.tasks.models import Task
 from src.infrastructure.telegram.calendar import _event_keyboard
@@ -80,18 +82,23 @@ async def test_view_requests_fetch_real_lists_without_llm_or_mutations(
     result = await use_case.execute(
         text=text, user_id=42, now=NOW, timezone="Europe/Moscow"
     )
-    assert isinstance(result, str)
+    assert isinstance(result, AssistantReply)
+    assert len(result.pages) == int(tasks) + int(events)
+    result_text = "\n".join(page.text for page in result.pages)
+    result = result_text
     assert (TASK.identifier in result) is tasks
     assert (EVENT.title in result) is events
     if tasks:
         assert TASK.status in result and TASK.url in result
-        integrations.list_tasks.assert_awaited_once_with()
+        integrations.list_tasks.assert_awaited_once_with(query=TaskQuery())
     else:
         integrations.list_tasks.assert_not_awaited()
     if events:
         assert "06.09.2026 12:00 MSK" in result
         assert EVENT.html_link is not None and EVENT.html_link in result
-        integrations.list_events.assert_awaited_once_with(user_id=42, now=NOW)
+        integrations.list_events.assert_awaited_once_with(
+            user_id=42, now=NOW, query=EventQuery().with_default_range(NOW)
+        )
     else:
         integrations.list_events.assert_not_awaited()
     llm.parse_message.assert_not_awaited()
@@ -145,7 +152,9 @@ async def test_natural_language_list_tasks_decision_is_executable() -> None:
             now=NOW,
             timezone="Europe/Moscow",
         )
-        assert isinstance(reply, str) and TASK.identifier in reply
+        assert (
+            isinstance(reply, AssistantReply) and TASK.identifier in reply.pages[0].text
+        )
     assert llm.parse_message.await_count == 2
     assert integrations.list_tasks.await_count == 2
 
@@ -188,8 +197,9 @@ async def test_agenda_preserves_other_source_on_failure(
     decision = parse_view_request("/agenda")
     assert decision is not None
     reply = await executor.execute_many(decision.actions, user_id=42, now=NOW)
-    assert isinstance(reply, str)
-    assert expected in reply and preserved in reply
+    assert isinstance(reply, AssistantReply)
+    assert expected in reply.text
+    assert preserved in reply.pages[0].text
 
 
 @pytest.mark.asyncio
@@ -203,11 +213,12 @@ async def test_empty_linear_list_has_clear_message() -> None:
     reply = await executor.execute(
         ListTasksAction(type=ActionType.LIST_TASKS), user_id=42, now=NOW
     )
-    assert reply == "В настроенной команде Linear нет неархивных задач."
+    assert isinstance(reply, AssistantReply)
+    assert "ничего не найдено" in reply.pages[0].text
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["tasks", "agenda"])
+@pytest.mark.parametrize("command", ["tasks", "agenda", "calendar"])
 @pytest.mark.parametrize("user_id", [42, 99, None])
 async def test_view_command_routing_and_allowlist(
     monkeypatch: pytest.MonkeyPatch,
@@ -245,7 +256,7 @@ async def test_view_command_routing_and_allowlist(
 async def test_view_commands_do_not_silently_ignore_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = SimpleNamespace(execute=AsyncMock())
+    process = SimpleNamespace(execute=AsyncMock(return_value="Выполненные задачи"))
     router = create_router(process_message=process, timezone="UTC", allowed_user_id=42)  # type: ignore[arg-type]
     message = Message(
         message_id=1,
@@ -257,8 +268,8 @@ async def test_view_commands_do_not_silently_ignore_arguments(
     answer = AsyncMock()
     monkeypatch.setattr(Message, "answer", answer)
     await router.propagate_event("message", message, bot=AsyncMock(spec=Bot))
-    process.execute.assert_not_awaited()
-    assert "без аргументов" in answer.call_args.args[0]
+    assert process.execute.call_args.kwargs["text"] == "Покажи задачи Linear: completed"
+    answer.assert_awaited_once_with("Выполненные задачи")
 
 
 @pytest.mark.asyncio

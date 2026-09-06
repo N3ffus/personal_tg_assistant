@@ -3,16 +3,19 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
+from src.application.ports.calendar import CalendarError, CalendarNotConnectedError
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
 from src.application.services.context import ContextService
 from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
 )
-from src.infrastructure.telegram.replies import answer_reply, answer_text
+from src.domain.assistant.replies import ResultPage
+from src.domain.assistant.retrieval import RetrievalLimitError
+from src.infrastructure.telegram.replies import answer_page, answer_reply, answer_text
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,47 @@ def create_router(
     router = Router(
         name=__name__,
     )
+
+    @router.callback_query(F.data.startswith("browse:"))
+    async def browse_callback(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if (
+            callback.from_user.id != allowed_user_id
+            or not callback.data
+            or not isinstance(callback.message, Message)
+        ):
+            return
+        try:
+            response = await process_message.browse(
+                user_id=callback.from_user.id,
+                data=callback.data,
+                now=datetime.now(ZoneInfo(timezone)),
+            )
+        except CalendarNotConnectedError:
+            response = "Подключите календарь командой /calendar_connect."
+        except (RetrievalLimitError, TimeoutError):
+            response = (
+                "Слишком большая выборка или долгий поиск. Уточните период или фильтры."
+            )
+        except (CalendarError, TaskTrackerError):
+            response = (
+                "Не удалось обновить список. Проверьте доступ и попробуйте позже."
+            )
+        except Exception:
+            logger.exception("Failed to navigate retrieval results")
+            response = "Не удалось открыть страницу. Повторите запрос."
+        if isinstance(response, ResultPage):
+            try:
+                # Calendar deletion confirmation is a separate message.
+                await answer_page(
+                    callback.message, response, edit=":delete:" not in callback.data
+                )
+            except TelegramBadRequest as error:
+                if "message is not modified" not in error.message.lower():
+                    logger.warning("Could not edit retrieval page")
+                    await answer_page(callback.message, response)
+        else:
+            await answer_text(callback.message, response)
 
     @router.callback_query(F.data.startswith("delyes:") | F.data.startswith("delno:"))
     async def deletion_callback(callback: CallbackQuery) -> None:
@@ -67,10 +111,13 @@ def create_router(
             "• Завтра в 15:00 стоматолог\n"
             "• Запомни, что я люблю Python\n\n"
             "Задачи и календарь:\n"
-            "/tasks — задачи Linear со статусами и ссылками\n"
-            "/calendar — ближайшие события\n"
+            "/tasks — задачи Linear с фильтрами и страницами\n"
+            "/calendar — события с фильтрами и страницами\n"
             "/agenda — задачи и события вместе\n"
-            "Можно написать: «Покажи задачи из Linear и события календаря».\n\n"
+            "По умолчанию по 10 записей, листать можно кнопками.\n"
+            "Например: «События за 2026 год», «Открытые задачи со словом ремонт», "
+            "«Задачи по теме отпуска по сроку».\n"
+            "Фильтры можно дописать к команде: /tasks выполненные за год.\n\n"
             "Контекст чатов:\n"
             "/history — посмотреть\n"
             "/compact — суммаризовать\n"
@@ -79,7 +126,7 @@ def create_router(
             "Все команды доступны по кнопке «Меню» рядом с полем сообщения."
         )
 
-    @router.message(Command("tasks", "agenda"))
+    @router.message(Command("tasks", "agenda", "calendar"))
     async def view_handler(message: Message, command: CommandObject) -> None:
         await text_handler(message, command=command)
 
@@ -95,6 +142,13 @@ def create_router(
         command: CommandObject | None = None,
     ) -> None:
         text = f"/{command.command}" if command else message.text
+        if command is not None and command.args:
+            subject = {
+                "tasks": "задачи Linear",
+                "calendar": "события Google Calendar",
+                "agenda": "задачи Linear и события Google Calendar",
+            }[command.command]
+            text = f"Покажи {subject}: {command.args}"
 
         if not text:
             return
@@ -103,12 +157,6 @@ def create_router(
             return
 
         if message.from_user.id != allowed_user_id:
-            return
-
-        if command is not None and command.args:
-            await message.answer(
-                "Команды /tasks и /agenda используются без аргументов."
-            )
             return
 
         try:

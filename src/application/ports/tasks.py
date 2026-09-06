@@ -1,6 +1,7 @@
 from typing import Protocol
 
 from src.domain.assistant.deletions import DeletionTarget
+from src.domain.assistant.retrieval import TaskQuery
 from src.domain.tasks.models import CreatedTask, Task
 
 
@@ -23,7 +24,7 @@ class TaskNotFoundError(TaskTrackerError):
 class TaskTrackerClient(Protocol):
     async def create_task(self, *, title: str) -> CreatedTask: ...
 
-    async def list_tasks(self) -> list[Task]: ...
+    async def list_tasks(self, *, query: TaskQuery | None = None) -> list[Task]: ...
 
     async def find_tasks(self, *, title: str | None) -> list[DeletionTarget]: ...
 

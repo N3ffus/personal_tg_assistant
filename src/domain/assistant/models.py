@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.domain.assistant.enums import ActionType
+from src.domain.assistant.retrieval import EventQuery, TaskQuery
 
 
 class DomainModel(BaseModel):
@@ -22,7 +23,7 @@ class CreateTaskAction(DomainModel):
     title: str
 
 
-class ListTasksAction(DomainModel):
+class ListTasksAction(TaskQuery):
     type: Literal[ActionType.LIST_TASKS]
 
 
@@ -41,7 +42,7 @@ class CreateEventAction(DomainModel):
     starts_at: datetime
 
 
-class ListEventsAction(DomainModel):
+class ListEventsAction(EventQuery):
     type: Literal[ActionType.LIST_EVENTS]
 
 

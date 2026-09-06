@@ -10,3 +10,6 @@ class CalendarEvent:
     ends_at: datetime
     html_link: str | None
     all_day: bool = False
+    description: str = ""
+    location: str = ""
+    updated_at: datetime | None = None

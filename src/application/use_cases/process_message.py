@@ -10,7 +10,7 @@ from src.application.services.explicit_commands import (
     parse_view_request,
 )
 from src.domain.assistant.context import ContextMessage
-from src.domain.assistant.replies import AssistantReply
+from src.domain.assistant.replies import AssistantReply, ResultPage
 
 
 class ProcessMessageUseCase:
@@ -71,6 +71,7 @@ class ProcessMessageUseCase:
                     [
                         response.text,
                         *(confirmation.text for confirmation in response.confirmations),
+                        *(page.text for page in response.pages),
                     ]
                 ).strip()
             )
@@ -113,3 +114,8 @@ class ProcessMessageUseCase:
         return await self._action_executor.resolve_deletion(
             user_id=user_id, operation_id=operation_id, confirm=confirm
         )
+
+    async def browse(
+        self, *, user_id: int, data: str, now: datetime
+    ) -> ResultPage | str:
+        return await self._action_executor.browse(user_id=user_id, data=data, now=now)

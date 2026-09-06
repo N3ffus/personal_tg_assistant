@@ -18,6 +18,12 @@ from src.application.ports.calendar import (
     CalendarNotConnectedError,
 )
 from src.domain.assistant.deletions import DeletionTarget
+from src.domain.assistant.retrieval import (
+    MAX_RETRIEVAL_ITEMS,
+    MAX_RETRIEVAL_PAGES,
+    EventQuery,
+    RetrievalLimitError,
+)
 from src.domain.calendar.models import CalendarEvent
 from src.infrastructure.calendar.storage import CalendarStorage
 
@@ -46,7 +52,13 @@ class GoogleCalendarClient:
         )
         return self._to_event(result)
 
-    async def list_events(self, *, user_id: int, now: datetime) -> list[CalendarEvent]:
+    async def list_events(
+        self, *, user_id: int, now: datetime, query: EventQuery | None = None
+    ) -> list[CalendarEvent]:
+        if query is not None:
+            return await self._search_events(
+                user_id=user_id, query=query.with_default_range(now)
+            )
         events: list[CalendarEvent] = []
         page_token: str | None = None
         seen_tokens: set[str] = set()
@@ -91,6 +103,56 @@ class GoogleCalendarClient:
             ):
                 raise CalendarError("Malformed Google Calendar pagination")
             seen_tokens.add(page_token)
+
+    async def _search_events(
+        self, *, user_id: int, query: EventQuery
+    ) -> list[CalendarEvent]:
+        assert query.date_from is not None and query.date_to is not None
+        params: dict[str, object] = {
+            "calendarId": "primary",
+            "timeMin": query.date_from.isoformat(),
+            "timeMax": query.date_to.isoformat(),
+            "maxResults": 2500,
+            "singleEvents": True,
+            "showDeleted": False,
+            "orderBy": "startTime",
+        }
+
+        def search(service: Any) -> list[CalendarEvent]:
+            events: dict[str, CalendarEvent] = {}
+            seen_tokens: set[str] = set()
+            scanned = 0
+            for _ in range(MAX_RETRIEVAL_PAGES):
+                result = service.events().list(**params).execute()
+                if not isinstance(result, Mapping) or not isinstance(
+                    result.get("items", []), list
+                ):
+                    raise CalendarError("Malformed Google Calendar response")
+                for item in result.get("items", []):
+                    scanned += 1
+                    if scanned > MAX_RETRIEVAL_ITEMS:
+                        raise RetrievalLimitError
+                    if not isinstance(item, Mapping):
+                        raise CalendarError("Malformed Google Calendar event")
+                    if item.get("status") == "cancelled":
+                        continue
+                    event = self._to_event(item, allow_all_day=True)
+                    if query.all_day is not None and query.all_day != event.all_day:
+                        continue
+                    if query.matches_text(
+                        event.title, event.description, event.location
+                    ):
+                        events[event.event_id] = event
+                token = result.get("nextPageToken")
+                if token is None:
+                    return list(events.values())
+                if not isinstance(token, str) or not token or token in seen_tokens:
+                    raise CalendarError("Malformed Google Calendar pagination")
+                seen_tokens.add(token)
+                params["pageToken"] = token
+            raise RetrievalLimitError
+
+        return await self._execute(user_id=user_id, operation=search)  # type: ignore[no-any-return]
 
     async def update_event(
         self, *, user_id: int, event_id: str, title: str, starts_at: datetime
@@ -249,7 +311,11 @@ class GoogleCalendarClient:
             if error.resp.status in {404, 410}:
                 raise CalendarEventNotFoundError from error
             raise CalendarError("Google Calendar request failed") from error
-        except (CalendarAuthorizationError, CalendarEventNotFoundError):
+        except (
+            CalendarAuthorizationError,
+            CalendarEventNotFoundError,
+            RetrievalLimitError,
+        ):
             raise
         except (RefreshError, TypeError, ValueError) as error:
             raise CalendarAuthorizationError from error
@@ -297,6 +363,12 @@ class GoogleCalendarClient:
         if html_link is not None and not isinstance(html_link, str):
             raise CalendarError("Malformed Google Calendar event")
         try:
+            updated = event.get("updated")
+            updated_at = (
+                datetime.fromisoformat(updated) if isinstance(updated, str) else None
+            )
+            if updated_at is not None and updated_at.tzinfo is None:
+                raise ValueError("Missing update timezone")
             if all_day:
                 # Preserve calendar dates regardless of the display timezone.
                 # Google uses an exclusive end date for all-day events.
@@ -318,6 +390,9 @@ class GoogleCalendarClient:
             ends_at=ends_at,
             html_link=html_link,
             all_day=all_day,
+            description=str(event.get("description") or ""),
+            location=str(event.get("location") or ""),
+            updated_at=updated_at,
         )
 
     @staticmethod
