@@ -145,19 +145,14 @@ async def test_duplicate_click_or_uneditable_message(
 
 
 @pytest.mark.asyncio
-async def test_calendar_confirmation_keeps_results_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    answer, edit = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(CallbackQuery, "answer", AsyncMock())
-    monkeypatch.setattr(Message, "answer", answer)
-    monkeypatch.setattr(Message, "edit_text", edit)
-    process = SimpleNamespace(browse=AsyncMock(return_value=PAGE))
-    router = create_router(process_message=process, timezone="UTC", allowed_user_id=42)  # type: ignore[arg-type]
-    await router.propagate_event(
-        "callback_query",
-        make_callback(message=make_message(), data="browse:token:delete:0"),
-        bot=AsyncMock(spec=Bot),
+async def test_single_page_result_is_sent_without_a_keyboard() -> None:
+    message = AsyncMock(spec=Message)
+    message.answer = AsyncMock()
+    await answer_reply(
+        message,
+        AssistantReply(
+            text="", confirmations=(), pages=(ResultPage("<b>Одна страница</b>", ()),)
+        ),
     )
-    answer.assert_awaited_once()
-    edit.assert_not_awaited()
+    message.answer.assert_awaited_once()
+    assert message.answer.call_args.kwargs["reply_markup"] is None

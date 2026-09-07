@@ -48,6 +48,7 @@ class ListEventsAction(EventQuery):
 
 class UpdateEventAction(DomainModel):
     type: Literal[ActionType.UPDATE_EVENT]
+    event_title: str = Field(min_length=1)
     title: str
     starts_at: datetime
 

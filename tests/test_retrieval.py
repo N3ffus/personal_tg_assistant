@@ -53,30 +53,23 @@ def dependencies(
     client = SimpleNamespace(
         list_tasks=AsyncMock(return_value=tasks or []),
         list_events=AsyncMock(return_value=events or []),
-        create_operation=AsyncMock(return_value="selection"),
-        delete_event=AsyncMock(),
     )
-    return RetrievalService(
-        calendar=client, task_tracker=client, storage=client
-    ), client
+    return RetrievalService(calendar=client, task_tracker=client), client
 
 
-def callback(page: ResultPage, command: str, value: int | None = None) -> str:
+def callback(page: ResultPage, value: int) -> str:
     return next(
         b.callback_data
         for row in page.buttons
         for b in row
-        if f":{command}:" in b.callback_data
-        and (value is None or b.callback_data.endswith(f":{value}"))
+        if b.callback_data.endswith(f":page:{value}")
     )
 
 
 async def navigate(
-    service: RetrievalService, page: ResultPage, command: str, value: int | None = None
+    service: RetrievalService, page: ResultPage, value: int
 ) -> ResultPage:
-    result = await service.navigate(
-        user_id=42, data=callback(page, command, value), now=NOW
-    )
+    result = await service.navigate(user_id=42, data=callback(page, value))
     assert isinstance(result, ResultPage)
     return result
 
@@ -90,22 +83,19 @@ async def test_pagination_has_ten_items_stable_back_next_and_no_extra_requests()
     assert first.text.count("<a href=") == 10
     assert "1–10 из 23" in first.text and "1/3" in first.text
     assert "APP-23:" in first.text and "APP-13:" not in first.text
-    second = await navigate(service, first, "page", 1)
+    second = await navigate(service, first, 1)
     assert "11–20 из 23" in second.text and "APP-13:" in second.text
-    third = await navigate(service, second, "page", 2)
+    third = await navigate(service, second, 2)
     assert third.text.count("<a href=") == 3 and "21–23 из 23" in third.text
     assert not any(":page:3" in b.callback_data for row in third.buttons for b in row)
-    back = await navigate(service, second, "page", 0)
+    back = await navigate(service, second, 0)
     assert back == first
     client.list_tasks.assert_awaited_once_with(query=TaskQuery())
-    client.create_operation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_refresh_keeps_full_filter_and_replaces_snapshot_only_after_success() -> (
-    None
-):
-    service, client = dependencies(tasks=[task(1)])
+async def test_keyboard_offers_pagination_only_and_never_refetches() -> None:
+    service, client = dependencies(tasks=[task(i) for i in range(1, 45)])
     query = TaskQuery(
         query="отчёт",
         search_terms=["год", "месяц"],
@@ -113,44 +103,52 @@ async def test_refresh_keeps_full_filter_and_replaces_snapshot_only_after_succes
         status_group="open",
         sort_by="due",
         direction="asc",
-        page_size=5,
+        page_size=10,
         date_from=NOW - timedelta(days=365),
         date_to=NOW,
     )
     first = await service.open(query=query, user_id=42, now=NOW)
-    client.list_tasks.side_effect = RuntimeError("offline")
-    with pytest.raises(RuntimeError):
-        await navigate(service, first, "refresh")
-    assert await navigate(service, first, "page", 0) == first
-    client.list_tasks.side_effect = None
-    client.list_tasks.return_value = [task(2)]
-    refreshed = await navigate(service, first, "refresh")
-    assert "APP-2:" in refreshed.text and "APP-1:" not in refreshed.text
-    assert client.list_tasks.call_args.kwargs["query"] == query
-    assert await navigate(service, first, "page", 0) == first
+    assert [
+        b.callback_data.rsplit(":", 2)[1] for row in first.buttons for b in row
+    ] == ["page"] * 4
+    assert [b.text for row in first.buttons for b in row] == [
+        "1/5",
+        "Далее »",
+        "« Первая",
+        "Последняя »",
+    ]
+    # Sorting, filters, refresh, editing and deletion are the LLM's job now.
+    last = await navigate(service, first, 4)
+    assert [b.text for row in last.buttons for b in row] == [
+        "« Назад",
+        "5/5",
+        "« Первая",
+        "Последняя »",
+    ]
+    assert "задайте сообщением" in first.text
+    client.list_tasks.assert_awaited_once_with(query=query)
 
 
 @pytest.mark.asyncio
-async def test_sort_direction_size_and_status_preserve_search() -> None:
-    service, client = dependencies(tasks=[task(1, title="Z"), task(2, title="A")])
-    page = await service.open(
-        query=TaskQuery(query="текст", sort_by="title", direction="asc"),
-        user_id=42,
-        now=NOW,
+async def test_single_page_result_carries_no_keyboard() -> None:
+    service, _ = dependencies(tasks=[task(1)])
+    page = await service.open(query=TaskQuery(), user_id=42, now=NOW)
+    assert page.buttons == ()
+
+
+@pytest.mark.asyncio
+async def test_sorting_requested_by_the_model_is_applied_to_the_whole_result() -> None:
+    service, _ = dependencies(tasks=[task(1, title="Z"), task(2, title="A")])
+    ascending = await service.open(
+        query=TaskQuery(sort_by="title", direction="asc"), user_id=42, now=NOW
     )
-    assert page.text.index("APP-2") < page.text.index("APP-1")
-    descending = await navigate(service, page, "direction")
+    assert ascending.text.index("APP-2") < ascending.text.index("APP-1")
+    assert "Сортировка: по названию ↑" in ascending.text
+    descending = await service.open(
+        query=TaskQuery(sort_by="title", direction="desc"), user_id=42, now=NOW
+    )
     assert descending.text.index("APP-1") < descending.text.index("APP-2")
-    resized = await navigate(service, descending, "size")
-    assert any(b.text == "По 20" for row in resized.buttons for b in row)
-    menu = await navigate(service, resized, "sort")
-    sorted_page = await navigate(service, menu, "order", 6)
-    assert "по статусу" in sorted_page.text
-    client.list_tasks.assert_awaited_once()
-    status = await navigate(service, sorted_page, "status")
-    assert "Открытые" in status.text
-    assert client.list_tasks.call_args.kwargs["query"].query == "текст"
-    assert client.list_tasks.call_args.kwargs["query"].status_group == "open"
+    assert "Сортировка: по названию ↓" in descending.text
 
 
 @pytest.mark.asyncio
@@ -177,7 +175,7 @@ async def test_missing_sort_values_always_last(sort_by: str, direction: str) -> 
 
 
 @pytest.mark.asyncio
-async def test_calendar_year_all_day_sort_and_select_use_server_ids() -> None:
+async def test_calendar_year_and_all_day_events_render_without_action_buttons() -> None:
     whole_day = event(
         1,
         event_id="x" * 1024,
@@ -194,41 +192,24 @@ async def test_calendar_year_all_day_sort_and_select_use_server_ids() -> None:
     assert "06.09.2026 12:00 MSK" in first.text
     query = client.list_events.call_args.kwargs["query"]
     assert query.date_from == NOW and query.date_to == NOW + timedelta(days=365)
-    assert all(
-        len(b.callback_data.encode()) <= 64 for row in first.buttons for b in row
-    )
-    assert not any(":edit:0" in b.callback_data for row in first.buttons for b in row)
-    reversed_page = await navigate(service, first, "direction")
-    # An older message still selects the original item after sorting elsewhere.
-    confirmation = await navigate(service, first, "delete", 0)
-    assert confirmation.buttons[0][0].callback_data == "calyes:selection"
-    client.create_operation.assert_awaited_once_with(
-        user_id=42, kind="delete", payload={"event_id": "x" * 1024}
-    )
-    client.delete_event.assert_not_awaited()
-    result = await service.navigate(
-        user_id=42, data=callback(reversed_page, "edit", 0), now=NOW
-    )
-    assert isinstance(result, str) and "новое название" in result
-    assert client.create_operation.call_args.kwargs["payload"] == {
-        "event_id": timed.event_id
-    }
+    # A 1024-byte event id never has to fit into 64 bytes of callback data.
+    assert first.buttons == ()
+    for command in ("edit", "delete"):
+        stale = await service.navigate(user_id=42, data=f"browse:token:{command}:0")
+        assert isinstance(stale, str)
 
 
 @pytest.mark.asyncio
-async def test_calendar_presets_keep_text_and_empty_results_offer_refresh() -> None:
+async def test_empty_results_keep_the_filters_and_drop_the_keyboard() -> None:
     service, client = dependencies()
-    first = await service.open(
+    page = await service.open(
         query=EventQuery(query="Python", all_day=False), user_id=42, now=NOW
     )
-    assert "ничего не найдено" in first.text
-    assert "0–0 из 0" in first.text
-    week = await navigate(service, first, "days", 7)
+    assert "ничего не найдено" in page.text
+    assert "0–0 из 0" in page.text
+    assert "Python" in page.text and page.buttons == ()
     query = client.list_events.call_args.kwargs["query"]
     assert query.query == "Python" and query.all_day is False
-    assert query.date_from == NOW.replace(hour=0)
-    assert query.date_to == NOW.replace(hour=0) + timedelta(days=7)
-    assert "Python" in week.text
 
 
 @pytest.mark.asyncio
@@ -237,41 +218,40 @@ async def test_foreign_forged_expired_and_out_of_range_callbacks(
 ) -> None:
     clock = Mock(return_value=10)
     monkeypatch.setattr(module, "monotonic", clock)
-    service, client = dependencies(tasks=[task(1)])
-    first = await service.open(query=TaskQuery(), user_id=42, now=NOW)
-    data = callback(first, "refresh")
-    assert isinstance(await service.navigate(user_id=99, data=data, now=NOW), str)
+    service, client = dependencies(tasks=[task(1), task(2)])
+    first = await service.open(query=TaskQuery(page_size=1), user_id=42, now=NOW)
+    data = callback(first, 1)
+    assert isinstance(await service.navigate(user_id=99, data=data), str)
     for invalid in (
         "browse:nope:page:0",
         "broken",
         data.rsplit(":", 1)[0] + ":-1",
         data.rsplit(":", 1)[0] + ":１２",
     ):
-        assert isinstance(
-            await service.navigate(user_id=42, data=invalid, now=NOW), str
-        )
+        assert isinstance(await service.navigate(user_id=42, data=invalid), str)
     prefix = data.rsplit(":", 2)[0]
-    for command in ("unknown:0", "delete:99", "edit:0", "days:7"):
+    # Every command the keyboard used to send is now rejected outright.
+    for command in ("unknown:0", "refresh:0", "sort:0", "delete:1", "edit:0", "days:7"):
         assert isinstance(
-            await service.navigate(user_id=42, data=f"{prefix}:{command}", now=NOW), str
+            await service.navigate(user_id=42, data=f"{prefix}:{command}"), str
         )
-    last = await service.navigate(user_id=42, data=f"{prefix}:page:99999", now=NOW)
-    assert isinstance(last, ResultPage) and "1/1" in last.text
+    last = await service.navigate(user_id=42, data=f"{prefix}:page:99999")
+    assert isinstance(last, ResultPage) and "2/2" in last.text
     clock.return_value = 10 + module.SESSION_TTL
-    assert "устарел" in str(await service.navigate(user_id=42, data=data, now=NOW))
+    assert "устарел" in str(await service.navigate(user_id=42, data=data))
     client.list_tasks.assert_awaited_once()
-    client.create_operation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_snapshot_cache_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(module, "MAX_SESSIONS", 2)
-    service, _ = dependencies()
+    service, _ = dependencies(tasks=[task(1), task(2)])
     pages = [
-        await service.open(query=TaskQuery(), user_id=42, now=NOW) for _ in range(3)
+        await service.open(query=TaskQuery(page_size=1), user_id=42, now=NOW)
+        for _ in range(3)
     ]
     assert "устарел" in str(
-        await service.navigate(user_id=42, data=callback(pages[0], "refresh"), now=NOW)
+        await service.navigate(user_id=42, data=callback(pages[0], 1))
     )
 
 

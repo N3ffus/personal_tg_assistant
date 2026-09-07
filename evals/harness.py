@@ -34,7 +34,6 @@ class RecordingIntegrations:
     scenario: Scenario
     calls: list[RecordedCall] = field(default_factory=list)
     task_count: int = 0
-    selection_consumed: bool = False
 
     async def find_tasks(self, *, title: str | None) -> list[DeletionTarget]:
         targets = [
@@ -57,13 +56,17 @@ class RecordingIntegrations:
     async def find_events(
         self, *, user_id: int, title: str | None
     ) -> list[DeletionTarget]:
-        targets = [
-            DeletionTarget(
-                id="eval-event",
-                title=title or "Встреча",
-                label=f"06.09.2026 12:00 — {title or 'Встреча'}",
-            )
-        ]
+        targets = (
+            []
+            if self.scenario.empty_calendar
+            else [
+                DeletionTarget(
+                    id="eval-event",
+                    title=title or "Встреча",
+                    label=f"06.09.2026 12:00 — {title or 'Встреча'}",
+                )
+            ]
+        )
         self.calls.append(
             RecordedCall(
                 "calendar.find_events",
@@ -215,12 +218,7 @@ class RecordingIntegrations:
     async def consume_latest_operation(
         self, *, user_id: int, kind: str
     ) -> dict[str, object] | None:
-        assert user_id == self.scenario.user_id
-        assert kind == "update"
-        if self.scenario.selected_event_id is None or self.selection_consumed:
-            return None
-        self.selection_consumed = True
-        return {"event_id": self.scenario.selected_event_id}
+        raise AssertionError("Editing must resolve the event by title, not by button")
 
 
 @dataclass

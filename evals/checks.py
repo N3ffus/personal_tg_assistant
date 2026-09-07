@@ -21,18 +21,32 @@ def assert_contract(
                 assert actual_data[key].strip()
 
     action_index = 0
+    found_event_ids: list[str] = []
     for call in run.calls:
         if call.name.startswith("calendar."):
             assert call.arguments["user_id"] == scenario.user_id
+        if call.name == "calendar.find_events":
+            targets = call.output
+            assert isinstance(targets, list)
+            found_event_ids = [target["id"] for target in targets]
         if call.name == "calendar.update_event":
-            assert call.arguments["event_id"] == scenario.selected_event_id
+            # Editing may only touch the single event the lookup resolved.
+            assert found_event_ids == [call.arguments["event_id"]]
         if call.name == "calendar.list_events":
             assert call.arguments["now"] == scenario.now.isoformat()
         # Compare observed arguments to the LLM decision, not reconstructed tool calls.
         while action_index < len(run.decision.actions):
             action = run.decision.actions[action_index]
+            data = action.model_dump(mode="json")
+            # An update is a lookup call followed by the update of the same action.
+            if (
+                action.type.value == "update_event"
+                and call.name == "calendar.find_events"
+            ):
+                assert call.arguments["title"] == data["event_title"]
+                break
             action_index += 1
-            deletion_calls = {
+            lookup_calls = {
                 "delete_task": "linear.find_tasks",
                 "delete_all_tasks": "linear.find_tasks",
                 "delete_event": "calendar.find_events",
@@ -40,9 +54,8 @@ def assert_contract(
             }
             if (
                 call.name.rsplit(".", 1)[1] == action.type.value
-                or deletion_calls.get(action.type.value) == call.name
+                or lookup_calls.get(action.type.value) == call.name
             ):
-                data = action.model_dump(mode="json")
                 for key in ("title", "starts_at"):
                     if key in data:
                         assert call.arguments[key] == data[key]

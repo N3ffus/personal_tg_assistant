@@ -10,6 +10,7 @@ from src.application.ports.tasks import (
     TaskTrackerError,
 )
 from src.application.services.action_executor import ActionExecutor
+from src.domain.assistant.deletions import DeletionTarget
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
     AssistantAction,
@@ -37,16 +38,26 @@ def event(*, html_link: str | None = "https://calendar.test/event-1") -> Calenda
     )
 
 
+def target(number: int) -> DeletionTarget:
+    return DeletionTarget(
+        id=f"event-{number}",
+        title="Стоматолог",
+        label=f"0{number}.09.2026 15:30 +0000 — Стоматолог",
+    )
+
+
 def dependencies(
     *,
     calendar_event: CalendarEvent | None = None,
     listed_events: list[CalendarEvent] | None = None,
+    found_events: list[DeletionTarget] | None = None,
     operation: dict[str, object] | None = None,
 ) -> tuple[ActionExecutor, SimpleNamespace, SimpleNamespace, SimpleNamespace]:
     returned_event = calendar_event or event()
     calendar = SimpleNamespace(
         create_event=AsyncMock(return_value=returned_event),
         list_events=AsyncMock(return_value=listed_events or []),
+        find_events=AsyncMock(return_value=found_events or []),
         update_event=AsyncMock(return_value=returned_event),
         delete_event=AsyncMock(),
         disconnect=AsyncMock(),
@@ -327,53 +338,58 @@ async def test_list_events_formats_empty_result() -> None:
     assert "ничего не найдено" in result.pages[0].text
 
 
-@pytest.mark.asyncio
-async def test_update_event_requires_prior_server_side_selection() -> None:
-    executor, calendar, pending, _ = dependencies(operation=None)
-    action = UpdateEventAction(
+def update_action() -> UpdateEventAction:
+    return UpdateEventAction(
         type=ActionType.UPDATE_EVENT,
+        event_title="стоматолог",
         title="Новый стоматолог",
         starts_at=EVENT_START,
     )
 
-    result = await executor.execute(action, user_id=42, now=NOW)
 
-    pending.consume_latest_operation.assert_awaited_once_with(
-        user_id=42,
-        kind="update",
-    )
+@pytest.mark.asyncio
+async def test_update_event_without_matches_asks_for_the_current_title() -> None:
+    executor, calendar, _, _ = dependencies(found_events=[])
+
+    result = await executor.execute(update_action(), user_id=42, now=NOW)
+
+    calendar.find_events.assert_awaited_once_with(user_id=42, title="стоматолог")
     calendar.update_event.assert_not_awaited()
-    assert result == "Сначала выберите событие для изменения через /calendar."
+    assert result == ("Событие «стоматолог» не найдено. Уточните его текущее название.")
 
 
 @pytest.mark.asyncio
-async def test_update_event_uses_selected_event_id_once() -> None:
+async def test_update_event_never_guesses_between_several_matches() -> None:
+    executor, calendar, _, _ = dependencies(found_events=[target(1), target(2)])
+
+    result = await executor.execute(update_action(), user_id=42, now=NOW)
+
+    calendar.update_event.assert_not_awaited()
+    assert isinstance(result, str)
+    assert "Уточните, какое изменить" in result
+    assert target(1).label in result and target(2).label in result
+
+
+@pytest.mark.asyncio
+async def test_update_event_uses_the_single_match_found_by_title() -> None:
     updated = CalendarEvent(
-        event_id="selected-event",
+        event_id="event-1",
         title="Новый стоматолог",
         starts_at=EVENT_START,
         ends_at=EVENT_START + timedelta(hours=1),
-        html_link="https://calendar.test/selected-event",
+        html_link="https://calendar.test/event-1",
     )
     executor, calendar, pending, _ = dependencies(
-        calendar_event=updated,
-        operation={"event_id": "selected-event"},
-    )
-    action = UpdateEventAction(
-        type=ActionType.UPDATE_EVENT,
-        title="Новый стоматолог",
-        starts_at=EVENT_START,
+        calendar_event=updated, found_events=[target(1)]
     )
 
-    result = await executor.execute(action, user_id=42, now=NOW)
+    result = await executor.execute(update_action(), user_id=42, now=NOW)
 
-    pending.consume_latest_operation.assert_awaited_once_with(
-        user_id=42,
-        kind="update",
-    )
+    calendar.find_events.assert_awaited_once_with(user_id=42, title="стоматолог")
+    pending.consume_latest_operation.assert_not_awaited()
     calendar.update_event.assert_awaited_once_with(
         user_id=42,
-        event_id="selected-event",
+        event_id="event-1",
         title="Новый стоматолог",
         starts_at=EVENT_START,
     )

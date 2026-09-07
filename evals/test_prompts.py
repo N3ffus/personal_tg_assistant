@@ -59,7 +59,6 @@ async def test_live_prompt_and_integrations(
             json.dumps(
                 {
                     "authenticated_user_id": scenario.user_id,
-                    "selected_event_id": scenario.selected_event_id,
                     "integration_calls": [asdict(call) for call in run.calls],
                 },
                 ensure_ascii=False,

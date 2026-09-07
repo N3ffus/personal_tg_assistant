@@ -44,7 +44,6 @@ def create_router(
             response = await process_message.browse(
                 user_id=callback.from_user.id,
                 data=callback.data,
-                now=datetime.now(ZoneInfo(timezone)),
             )
         except CalendarNotConnectedError:
             response = "Подключите календарь командой /calendar_connect."
@@ -61,10 +60,7 @@ def create_router(
             response = "Не удалось открыть страницу. Повторите запрос."
         if isinstance(response, ResultPage):
             try:
-                # Calendar deletion confirmation is a separate message.
-                await answer_page(
-                    callback.message, response, edit=":delete:" not in callback.data
-                )
+                await answer_page(callback.message, response, edit=True)
             except TelegramBadRequest as error:
                 if "message is not modified" not in error.message.lower():
                     logger.warning("Could not edit retrieval page")
@@ -114,9 +110,11 @@ def create_router(
             "/tasks — задачи Linear с фильтрами и страницами\n"
             "/calendar — события с фильтрами и страницами\n"
             "/agenda — задачи и события вместе\n"
-            "По умолчанию по 10 записей, листать можно кнопками.\n"
+            "По умолчанию по 10 записей; кнопки только листают страницы.\n"
+            "Фильтры, сортировку, изменение и удаление пиши сообщением.\n"
             "Например: «События за 2026 год», «Открытые задачи со словом ремонт», "
-            "«Задачи по теме отпуска по сроку».\n"
+            "«Задачи по теме отпуска по сроку», «Перенеси стоматолога на завтра "
+            "в 16:00», «Удали событие стоматолог».\n"
             "Фильтры можно дописать к команде: /tasks выполненные за год.\n\n"
             "Контекст чатов:\n"
             "/history — посмотреть\n"

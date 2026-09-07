@@ -18,7 +18,6 @@ class Scenario:
     now: datetime = NOW
     timezone: str = "Europe/Moscow"
     user_id: int = 42
-    selected_event_id: str | None = None
     empty_calendar: bool = False
     failure: (
         Literal[
@@ -243,33 +242,35 @@ SCENARIOS = (
         empty_calendar=True,
     ),
     Scenario(
-        "update_selected",
+        "update_found_by_title",
         "Перенеси событие «Стоматолог» на завтра в 16:00",
         (
             {
                 "type": "update_event",
+                "event_title": "Стоматолог",
                 "title": "Стоматолог",
                 "starts_at": "2026-09-06T16:00:00+03:00",
             },
         ),
-        ("calendar.update_event",),
-        "Изменить выбранное событие selected-event на 6 сентября в 16:00, сохранив название Стоматолог.",
+        ("calendar.find_events", "calendar.update_event"),
+        "Найти событие по текущему названию Стоматолог и перенести его на 6 сентября в 16:00, сохранив название.",
         ("Событие изменено", "06.09.2026 16:00"),
-        selected_event_id="selected-event",
     ),
     Scenario(
-        "update_without_selection",
+        "update_without_matching_event",
         "Перенеси событие «Стоматолог» на завтра в 16:00",
         (
             {
                 "type": "update_event",
+                "event_title": "Стоматолог",
                 "title": "Стоматолог",
                 "starts_at": "2026-09-06T16:00:00+03:00",
             },
         ),
-        (),
-        "Предложить сначала выбрать событие через /calendar. Без изменения случайного события и ложного успеха.",
-        ("Сначала выберите", "/calendar"),
+        ("calendar.find_events",),
+        "Сообщить, что событие не найдено, и попросить уточнить название. Без изменения случайного события и ложного успеха.",
+        ("не найдено", "Уточните"),
+        empty_calendar=True,
     ),
     Scenario(
         "delete_confirmation",

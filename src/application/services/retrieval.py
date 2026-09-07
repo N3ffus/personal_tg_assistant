@@ -2,13 +2,13 @@ import asyncio
 import secrets
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 from time import monotonic
 from urllib.parse import urlsplit
 
-from src.application.ports.calendar import CalendarClient, PendingOperationStore
+from src.application.ports.calendar import CalendarClient
 from src.application.ports.tasks import TaskTrackerClient
 from src.domain.assistant.replies import ReplyButton, ResultPage
 from src.domain.assistant.retrieval import EventQuery, TaskQuery
@@ -76,7 +76,6 @@ class BrowseSession:
     items: Sequence[Task | CalendarEvent]
     now: datetime
     expires_at: float
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class RetrievalService:
@@ -85,11 +84,9 @@ class RetrievalService:
         *,
         calendar: CalendarClient,
         task_tracker: TaskTrackerClient,
-        storage: PendingOperationStore,
     ) -> None:
         self._calendar = calendar
         self._tasks = task_tracker
-        self._storage = storage
         self._sessions: OrderedDict[str, BrowseSession] = OrderedDict()
 
     async def open(
@@ -126,125 +123,19 @@ class RetrievalService:
             if self._sessions[token].expires_at <= monotonic():
                 del self._sessions[token]
 
-    async def navigate(
-        self, *, user_id: int, data: str, now: datetime
-    ) -> ResultPage | str:
+    async def navigate(self, *, user_id: int, data: str) -> ResultPage | str:
+        """Turn pages of a stored snapshot. Everything else goes through the LLM."""
         self._purge()
         parts = data.split(":")
-        if len(parts) != 4 or parts[0] != "browse":
+        if len(parts) != 4 or parts[0] != "browse" or parts[2] != "page":
             return "Кнопка недействительна."
-        _, token, command, value = parts
+        _, token, _, value = parts
         session = self._sessions.get(token)
         if session is None or session.user_id != user_id:
             return "Список устарел. Повторите запрос или откройте /tasks, /calendar, /agenda."
         if not value.isascii() or not value.isdigit() or len(value) > 6:
             return "Кнопка недействительна."
-        position = int(value)
-        async with session.lock:
-            if command in {"edit", "delete"}:
-                return await self._select(session, command, position)
-            if command == "page":
-                return self._render(token, session, position)
-            query = session.query
-            if command in {"sort", "order"}:
-                keys = (
-                    list(SORT_LABELS)
-                    if isinstance(query, TaskQuery)
-                    else ["start", "title", "updated"]
-                )
-                if isinstance(query, TaskQuery):
-                    keys.remove("start")
-                if command == "sort":
-                    options = tuple(
-                        ReplyButton(
-                            "По " + SORT_LABELS[key], f"browse:{token}:order:{index}"
-                        )
-                        for index, key in enumerate(keys)
-                    )
-                    rows = tuple(options[i : i + 2] for i in range(0, len(options), 2))
-                    return replace(
-                        self._render(token, session, position),
-                        buttons=rows
-                        + (
-                            (
-                                ReplyButton(
-                                    "← К списку", f"browse:{token}:page:{position}"
-                                ),
-                            ),
-                        ),
-                    )
-                if position >= len(keys):
-                    return "Кнопка недействительна."
-                query = query.model_copy(update={"sort_by": keys[position]})
-            elif command == "direction":
-                query = query.model_copy(
-                    update={"direction": "desc" if query.direction == "asc" else "asc"}
-                )
-            elif command == "size":
-                size = {5: 10, 10: 20, 20: 5}.get(query.page_size, 10)
-                query = query.model_copy(update={"page_size": size})
-            elif command == "status" and isinstance(query, TaskQuery):
-                groups = list(STATUS_LABELS)
-                query = query.model_copy(
-                    update={
-                        "status": None,
-                        "status_group": groups[
-                            (groups.index(query.status_group) + 1) % len(groups)
-                        ],
-                    }
-                )
-            elif (
-                command == "days"
-                and isinstance(query, EventQuery)
-                and position in {1, 7, 30, 365}
-            ):
-                start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                query = query.model_copy(
-                    update={
-                        "date_from": start,
-                        "date_to": start + timedelta(days=position),
-                    }
-                )
-            elif command != "refresh":
-                return "Кнопка недействительна."
-            items = session.items
-            if command in {"refresh", "status", "days"}:
-                items = await self._fetch(query, user_id, now)
-            # Failed refreshes leave the previous query and snapshot intact.
-            updated = replace(
-                session,
-                query=query,
-                items=list(items),
-                lock=asyncio.Lock(),
-                now=now if command in {"refresh", "status", "days"} else session.now,
-            )
-            self._sort(updated)
-            return self._remember(updated)
-
-    async def _select(
-        self, session: BrowseSession, command: str, position: int
-    ) -> ResultPage | str:
-        if position >= len(session.items):
-            return "Кнопка недействительна."
-        item = session.items[position]
-        if not isinstance(item, CalendarEvent) or (command == "edit" and item.all_day):
-            return "Это действие недоступно."
-        operation_id = await self._storage.create_operation(
-            user_id=session.user_id,
-            kind="update" if command == "edit" else "delete",
-            payload={"event_id": item.event_id},
-        )
-        if command == "edit":
-            return f"Выбрано событие «{clip(item.title, 160)}». Напишите новое название и время события."
-        return ResultPage(
-            text=f"Удалить событие «{escape(clip(item.title, 160))}» ({event_when(item, session.now)})?",
-            buttons=(
-                (
-                    ReplyButton("Да, удалить", f"calyes:{operation_id}"),
-                    ReplyButton("Отмена", f"calno:{operation_id}"),
-                ),
-            ),
-        )
+        return self._render(token, session, int(value))
 
     @staticmethod
     def _sort(session: BrowseSession) -> None:
@@ -370,67 +261,23 @@ class RetrievalService:
             f"Страница {page + 1}/{pages} · {start + 1 if count else 0}–{start + len(selected)} из {count}"
         )
         lines.append(
-            f"Данные на {session.now:%d.%m %H:%M}. Фильтры можно задать сообщением."
+            f"Данные на {session.now:%d.%m %H:%M}. Кнопки только листают страницы; "
+            "фильтры, сортировку, обновление, изменение и удаление задайте сообщением."
         )
 
-        def button(label: str, command: str, value: int = 0) -> ReplyButton:
-            return ReplyButton(label, f"browse:{token}:{command}:{value}")
+        def button(label: str, target: int) -> ReplyButton:
+            return ReplyButton(label, f"browse:{token}:page:{target}")
 
-        rows = []
-        navigation = []
-        if page:
-            navigation.append(button("« Назад", "page", page - 1))
-        navigation.append(button(f"{page + 1}/{pages}", "page", page))
-        if page + 1 < pages:
-            navigation.append(button("Далее »", "page", page + 1))
-        rows.append(tuple(navigation))
-        if pages > 3:
-            rows.append(
-                (
-                    button("« Первая", "page", 0),
-                    button("Последняя »", "page", pages - 1),
-                )
-            )
-        rows.append(
-            (button("↻ Обновить", "refresh"), button(f"По {query.page_size}", "size"))
-        )
-        rows.append(
-            (
-                button(f"По {SORT_LABELS[query.sort_by]} ▾", "sort", page),
-                button(direction + " Порядок", "direction"),
-            )
-        )
-        if isinstance(query, TaskQuery):
-            rows.append(
-                (
-                    button(
-                        "Статус: "
-                        + (
-                            clip(query.status, 25)
-                            if query.status
-                            else STATUS_LABELS[query.status_group]
-                        ),
-                        "status",
-                    ),
-                )
-            )
-        else:
-            rows.append(
-                tuple(
-                    button(label, "days", days)
-                    for label, days in (
-                        ("Сегодня", 1),
-                        ("7 дней", 7),
-                        ("30 дней", 30),
-                        ("Год", 365),
-                    )
-                )
-            )
-            for position, item in enumerate(selected, start):
-                if isinstance(item, CalendarEvent):
-                    actions = []
-                    if not item.all_day:
-                        actions.append(button(f"✏️ {position + 1}", "edit", position))
-                    actions.append(button(f"🗑 {position + 1}", "delete", position))
-                    rows.append(tuple(actions))
+        # Pagination is the only keyboard action: one page needs no keyboard at all.
+        rows: list[tuple[ReplyButton, ...]] = []
+        if pages > 1:
+            navigation = []
+            if page:
+                navigation.append(button("« Назад", page - 1))
+            navigation.append(button(f"{page + 1}/{pages}", page))
+            if page + 1 < pages:
+                navigation.append(button("Далее »", page + 1))
+            rows.append(tuple(navigation))
+            if pages > 3:
+                rows.append((button("« Первая", 0), button("Последняя »", pages - 1)))
         return ResultPage("\n\n".join(lines), tuple(rows))

@@ -36,7 +36,10 @@ async def answer_reply(message: Message, reply: str | AssistantReply) -> None:
         await answer_text(message, confirmation.text, reply_markup=keyboard)
 
 
-def page_keyboard(page: ResultPage) -> InlineKeyboardMarkup:
+def page_keyboard(page: ResultPage) -> InlineKeyboardMarkup | None:
+    # A single-page result carries no buttons at all.
+    if not page.buttons:
+        return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [

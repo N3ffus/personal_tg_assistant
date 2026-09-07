@@ -52,9 +52,7 @@ class ActionExecutor:
         self._calendar = calendar
         self._pending_operations = pending_operations
         self._task_tracker = task_tracker
-        self._retrieval = RetrievalService(
-            calendar=calendar, task_tracker=task_tracker, storage=pending_operations
-        )
+        self._retrieval = RetrievalService(calendar=calendar, task_tracker=task_tracker)
         self._deletions = DeletionService(
             calendar=calendar, task_tracker=task_tracker, storage=pending_operations
         )
@@ -199,15 +197,24 @@ class ActionExecutor:
             return AssistantReply(text="", confirmations=(), pages=(page,))
 
         if isinstance(action, UpdateEventAction):
-            payload = await self._pending_operations.consume_latest_operation(
-                user_id=user_id,
-                kind="update",
+            targets = await self._calendar.find_events(
+                user_id=user_id, title=action.event_title
             )
-            if payload is None:
-                return "Сначала выберите событие для изменения через /calendar."
+            if not targets:
+                return (
+                    f"Событие «{action.event_title}» не найдено. "
+                    "Уточните его текущее название."
+                )
+            if len(targets) > 1:
+                # Editing is not confirmable like deletion: never guess the event.
+                listing = "\n".join(f"• {target.label}" for target in targets)
+                return (
+                    "Найдено несколько подходящих событий. Уточните, какое изменить:\n"
+                    f"{listing}"
+                )
             event = await self._calendar.update_event(
                 user_id=user_id,
-                event_id=str(payload["event_id"]),
+                event_id=targets[0].id,
                 title=action.title,
                 starts_at=action.starts_at,
             )
@@ -236,10 +243,8 @@ class ActionExecutor:
             )
         return "\n".join(lines)
 
-    async def browse(
-        self, *, user_id: int, data: str, now: datetime
-    ) -> ResultPage | str:
-        return await self._retrieval.navigate(user_id=user_id, data=data, now=now)
+    async def browse(self, *, user_id: int, data: str) -> ResultPage | str:
+        return await self._retrieval.navigate(user_id=user_id, data=data)
 
     @staticmethod
     def format_events(
