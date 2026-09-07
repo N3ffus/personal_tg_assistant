@@ -280,9 +280,13 @@ class RetrievalService:
         )
         known = [item for item in ordered if value(item) is not None]
         missing = [item for item in ordered if value(item) is None]
-        known.sort(
-            key=lambda item: value(item) or 0, reverse=session.query.direction == "desc"
-        )
+
+        def sort_value(item: Task | CalendarEvent) -> str | float:
+            result = value(item)
+            assert result is not None
+            return result
+
+        known.sort(key=sort_value, reverse=session.query.direction == "desc")
         session.items = tuple(known + missing)
 
     @staticmethod
@@ -356,7 +360,7 @@ class RetrievalService:
                     details += " · " + PRIORITIES[item.priority]
                 url = item.url
             else:
-                label = clip(item.title, 85)
+                label = clip(item.title, 85) or "Без названия"
                 details = event_when(item, session.now)
                 url = item.html_link
             lines.append(

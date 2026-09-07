@@ -60,6 +60,11 @@ class GonkaGateLLMClient:
             '"text":"Люблю Python"}]}\n'
             f"Текущее время: {now.isoformat()}\n"
             f"Timezone пользователя: {timezone}"
+            "\nПеред ответом проверь ВСЕ ограничения запроса: период, текст, статус, "
+            "сортировку. Явная сортировка ОБЯЗАТЕЛЬНО задаёт sort_by: "
+            "например, «по названию» — title, «сначала ближайший срок» — due asc.\n"
+            "JSON schema ответа:\n"
+            + json.dumps(AssistantDecision.model_json_schema(), ensure_ascii=False)
         )
 
         response = await self._client.chat.completions.create(

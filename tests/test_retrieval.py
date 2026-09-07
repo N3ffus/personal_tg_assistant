@@ -341,3 +341,13 @@ def test_date_defaults_text_and_theme_semantics() -> None:
     assert query.matches_text("Ремонт квартиры", "Нужен электрик")
     assert not query.matches_text("Ремонт машины")
     assert not query.matches_text("электрик")
+
+
+@pytest.mark.asyncio
+async def test_calendar_empty_titles_sort_with_named_events() -> None:
+    service, _ = dependencies(events=[event(1, title="Planning"), event(2, title="")])
+    page = await service.open(query=EventQuery(sort_by="title"), user_id=42, now=NOW)
+    assert "Без названия" in page.text
+    assert page.text.index("https://calendar.test/2") < page.text.index(
+        "https://calendar.test/1"
+    )
