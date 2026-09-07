@@ -6,6 +6,7 @@ from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config import SearchConfig
 from graphiti_core.search.search_config_recipes import (
+    COMBINED_HYBRID_SEARCH_RRF,
     EDGE_HYBRID_SEARCH_RRF,
     NODE_HYBRID_SEARCH_RRF,
 )
@@ -23,13 +24,16 @@ logger = logging.getLogger(__name__)
 # first-person facts ("я перешёл в компанию B") a subject to attach to.
 MESSAGE_SPEAKER = "Пользователь"
 
-# Extraction does not always build an edge: a detail stated in passing often
-# survives only in the summary of an entity node. Searching edges alone made
-# such a fact unreachable, so the search spans both layers. Episodes and
-# communities stay out of it: they add queries without adding facts.
+# Extraction is lossy in two steps. A detail stated in passing often survives
+# only in the summary of an entity node, and sometimes not even there: in
+# production a birth date the user asked to remember left no edge and no
+# summary, while the episode still held the sentence verbatim. The search
+# therefore spans all three layers, ending at the user's own words.
+# Communities stay out: they add a query without adding facts.
 SEARCH_CONFIG = SearchConfig(
     edge_config=EDGE_HYBRID_SEARCH_RRF.edge_config,
     node_config=NODE_HYBRID_SEARCH_RRF.node_config,
+    episode_config=COMBINED_HYBRID_SEARCH_RRF.episode_config,
 )
 
 EPISODE_TYPES: dict[KnowledgeSourceType, EpisodeType] = {
@@ -87,6 +91,9 @@ class GraphitiKnowledgeMemory:
             # Defence in depth: never surface a result from another namespace.
             edges = [edge for edge in results.edges if edge.group_id == namespace]
             nodes = [node for node in results.nodes if node.group_id == namespace]
+            episodes = [
+                episode for episode in results.episodes if episode.group_id == namespace
+            ]
             sources = await self._episode_names(
                 namespace=namespace,
                 uuids=[uuid for edge in edges for uuid in edge.episodes],
@@ -104,8 +111,8 @@ class GraphitiKnowledgeMemory:
             )
             for edge in edges
         ]
-        # Both endpoints of an edge repeat its fact in their summary, so the same
-        # sentence arrives up to three times. Only new wording earns a slot.
+        # Both endpoints of an edge repeat its fact in their summary, and the
+        # episode may repeat it once more. Only new wording earns a slot.
         seen = {fact.fact for fact in edge_facts}
         node_facts: list[KnowledgeFact] = []
         for node in nodes:
@@ -115,7 +122,18 @@ class GraphitiKnowledgeMemory:
                 continue
             seen.add(text)
             node_facts.append(KnowledgeFact(fact=text))
-        return _interleaved(edge_facts, node_facts)[:limit]
+        episode_facts: list[KnowledgeFact] = []
+        for episode in episodes:
+            text = _without_speaker(episode.content)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            episode_facts.append(
+                KnowledgeFact(
+                    fact=text, valid_from=episode.valid_at, source=episode.name
+                )
+            )
+        return _interleaved(edge_facts, node_facts, episode_facts)[:limit]
 
     async def healthcheck(self) -> bool:
         try:
@@ -146,13 +164,17 @@ class GraphitiKnowledgeMemory:
         }
 
 
-def _interleaved(
-    edge_facts: list[KnowledgeFact], node_facts: list[KnowledgeFact]
-) -> list[KnowledgeFact]:
-    """Alternate both layers so the limit can never starve one of them."""
+def _without_speaker(content: str) -> str:
+    """Drop the ``"Пользователь: "`` prefix ``remember`` adds for extraction."""
+    prefix = f"{MESSAGE_SPEAKER}: "
+    return content.removeprefix(prefix).strip() if content else ""
+
+
+def _interleaved(*layers: list[KnowledgeFact]) -> list[KnowledgeFact]:
+    """Alternate the layers so the limit can never starve one of them."""
     ordered: list[KnowledgeFact] = []
-    for pair in zip_longest(edge_facts, node_facts):
-        ordered.extend(fact for fact in pair if fact is not None)
+    for group in zip_longest(*layers):
+        ordered.extend(fact for fact in group if fact is not None)
     return ordered
 
 

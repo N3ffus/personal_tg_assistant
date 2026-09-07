@@ -81,6 +81,18 @@ def episodic(uuid: str, *, name: str, group_id: str) -> SimpleNamespace:
     return SimpleNamespace(uuid=uuid, name=name, group_id=group_id)
 
 
+def found_episode(
+    *,
+    content: str = "Пользователь: родился 02.05.2003 в г. Красноярск",
+    group_id: str,
+    name: str = "telegram_message:627",
+    valid_at: datetime | None = NOW,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        content=content, group_id=group_id, name=name, valid_at=valid_at
+    )
+
+
 def entity(
     *,
     name: str = "Красноярск",
@@ -96,10 +108,12 @@ class FakeGraphiti:
         *,
         edges: list[SimpleNamespace] | None = None,
         nodes: list[SimpleNamespace] | None = None,
+        found_episodes: list[SimpleNamespace] | None = None,
         error: Exception | None = None,
     ) -> None:
         self.edges = edges or []
         self.nodes = nodes or []
+        self.found_episodes = found_episodes or []
         self.error = error
         self.episodes: list[dict[str, Any]] = []
         self.searches: list[dict[str, Any]] = []
@@ -121,7 +135,9 @@ class FakeGraphiti:
         if self.error:
             raise self.error
         self.searches.append(kwargs)
-        return SimpleNamespace(edges=self.edges, nodes=self.nodes)
+        return SimpleNamespace(
+            edges=self.edges, nodes=self.nodes, episodes=self.found_episodes
+        )
 
     async def close(self) -> None:
         self.closed = True
@@ -448,6 +464,57 @@ async def test_adapter_drops_node_summaries_that_repeat_a_fact(
     ]
     # The edge keeps its provenance: the duplicate dropped is the summary.
     assert facts[0].source == "note:7"
+
+
+@pytest.mark.asyncio
+async def test_adapter_surfaces_the_episode_when_extraction_kept_nothing() -> None:
+    """Production lost a birth date entirely: no edge, no summary, only the episode.
+
+    The user's own sentence is the ground truth, so it stays reachable even when
+    extraction produced nothing usable from it.
+    """
+    graphiti = FakeGraphiti(found_episodes=[found_episode(group_id="user_abc")])
+
+    facts = await memory(graphiti).search(
+        namespace="user_abc", query="дата рождения", limit=5
+    )
+
+    assert facts == [
+        KnowledgeFact(
+            # The speaker prefix is Graphiti's parsing aid, not part of the fact.
+            fact="родился 02.05.2003 в г. Красноярск",
+            valid_from=NOW,
+            source="telegram_message:627",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_never_returns_an_episode_from_another_namespace() -> None:
+    graphiti = FakeGraphiti(
+        found_episodes=[
+            found_episode(content="Чужое", group_id=OTHER_NAMESPACE),
+            found_episode(content="Своё", group_id="user_abc"),
+        ]
+    )
+
+    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
+
+    assert [fact.fact for fact in facts] == ["Своё"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_drops_an_episode_that_only_repeats_a_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graphiti = FakeGraphiti(
+        edges=[edge(fact="Работает с Python", group_id="user_abc", episodes=[])],
+        found_episodes=[found_episode(content="Работает с Python", group_id="user_abc")],
+    )
+
+    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
+
+    assert [fact.fact for fact in facts] == ["Работает с Python"]
 
 
 @pytest.mark.asyncio
