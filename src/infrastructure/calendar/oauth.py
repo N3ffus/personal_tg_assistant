@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
+from src.application.services.knowledge import KnowledgeService
 from src.infrastructure.calendar.google import SCOPES
 from src.infrastructure.calendar.storage import CalendarStorage
 
@@ -89,12 +90,23 @@ class GoogleOAuthService:
         return payload
 
 
-def create_oauth_app(*, oauth: GoogleOAuthService) -> FastAPI:
+def create_oauth_app(
+    *, oauth: GoogleOAuthService, knowledge: KnowledgeService | None = None
+) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready() -> dict[str, str]:
+        # Knowledge memory is optional, so its state is reported, never fatal.
+        if knowledge is None:
+            memory = "disabled"
+        else:
+            memory = "ok" if await knowledge.healthcheck() else "unavailable"
+        return {"status": "ok", "knowledge": memory}
 
     @app.get("/oauth/google/callback", response_class=HTMLResponse)
     async def callback(

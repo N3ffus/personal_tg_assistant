@@ -302,3 +302,27 @@ async def test_callback_hides_token_exchange_failure() -> None:
     assert response.status_code == 502
     assert "Попробуйте снова" in response.text
     assert "secret" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("knowledge", "expected"),
+    [
+        (None, "disabled"),
+        (SimpleNamespace(healthcheck=AsyncMock(return_value=True)), "ok"),
+        (SimpleNamespace(healthcheck=AsyncMock(return_value=False)), "unavailable"),
+    ],
+)
+async def test_ready_endpoint_reports_knowledge_memory(
+    knowledge: object, expected: str
+) -> None:
+    oauth = SimpleNamespace(complete=AsyncMock())
+
+    response = await request(
+        create_oauth_app(oauth=oauth, knowledge=knowledge),  # type: ignore[arg-type]
+        "/ready",
+    )
+
+    assert response.status_code == 200
+    # A broken graph never makes the bot itself look unhealthy.
+    assert response.json() == {"status": "ok", "knowledge": expected}

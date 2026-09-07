@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "tzdata>=2025.2",
     "uvicorn>=0.40.0",
+    "graphiti-core>=0.30.1",
 ]
 
 [dependency-groups]
@@ -29,6 +30,8 @@ dev = [
 ]
 eval = [
     "deepeval>=3.9.9,<4",
+    "reportlab>=4.4.4",
+    "types-reportlab>=4.4.0",
 ]
 
 [build-system]
@@ -73,5 +76,8 @@ show_missing = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "evals"]
-addopts = "-p no:deepeval --strict-markers"
-markers = ["llm_eval: paid, live LLM calls; requires --run-llm-evals"]
+addopts = "-p no:deepeval --strict-markers -m 'not integration'"
+markers = [
+    "llm_eval: paid, live LLM calls; requires --run-llm-evals",
+    "integration: live Neo4j and LLM provider; run with make test-integration",
+]

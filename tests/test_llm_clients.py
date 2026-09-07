@@ -66,6 +66,90 @@ async def test_openai_client_requests_structured_decision_with_user_context() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("client_name", ["openai", "gonkagate"])
+async def test_recalled_knowledge_turns_the_call_into_an_answer_turn(
+    client_name: str,
+) -> None:
+    """A repeated search would loop and bury the answer under a raw fact dump."""
+    expected = AssistantDecision(actions=[ChatAction(type=ActionType.CHAT, text="Ок")])
+    if client_name == "openai":
+        client: OpenAILLMClient | GonkaGateLLMClient = OpenAILLMClient(
+            api_key="test-key", base_url="https://example.test/v1", model="test-model"
+        )
+        call = AsyncMock(return_value=SimpleNamespace(output_parsed=expected))
+        client._client.responses.parse = call  # type: ignore[method-assign]
+    else:
+        client = GonkaGateLLMClient(
+            api_key="test-key", base_url="https://example.test/v1", model="test-model"
+        )
+        call = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=expected.model_dump_json())
+                    )
+                ]
+            )
+        )
+        client._client.chat.completions.create = call  # type: ignore[method-assign]
+
+    await client.parse_message(
+        text="Сколько мне лет",
+        now=NOW,
+        timezone="Europe/Moscow",
+        knowledge='[{"fact": "Работает с Python"}]',
+    )
+
+    assert call.await_args is not None
+    kwargs = call.await_args.kwargs
+    instructions = (
+        kwargs["instructions"]
+        if client_name == "openai"
+        else kwargs["messages"][0]["content"]
+    )
+    assert "Повторный search_knowledge невозможен" in instructions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_name", ["openai", "gonkagate"])
+async def test_the_answer_turn_instruction_is_absent_without_recall(
+    client_name: str,
+) -> None:
+    expected = AssistantDecision(actions=[ChatAction(type=ActionType.CHAT, text="Ок")])
+    if client_name == "openai":
+        client: OpenAILLMClient | GonkaGateLLMClient = OpenAILLMClient(
+            api_key="test-key", base_url="https://example.test/v1", model="test-model"
+        )
+        call = AsyncMock(return_value=SimpleNamespace(output_parsed=expected))
+        client._client.responses.parse = call  # type: ignore[method-assign]
+    else:
+        client = GonkaGateLLMClient(
+            api_key="test-key", base_url="https://example.test/v1", model="test-model"
+        )
+        call = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=expected.model_dump_json())
+                    )
+                ]
+            )
+        )
+        client._client.chat.completions.create = call  # type: ignore[method-assign]
+
+    await client.parse_message(text="Привет", now=NOW, timezone="Europe/Moscow")
+
+    assert call.await_args is not None
+    kwargs = call.await_args.kwargs
+    instructions = (
+        kwargs["instructions"]
+        if client_name == "openai"
+        else kwargs["messages"][0]["content"]
+    )
+    assert "Повторный search_knowledge невозможен" not in instructions
+
+
+@pytest.mark.asyncio
 async def test_openai_client_rejects_missing_structured_output() -> None:
     client = OpenAILLMClient(
         api_key="test-key",

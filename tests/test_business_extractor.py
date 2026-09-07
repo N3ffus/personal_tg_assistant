@@ -387,9 +387,13 @@ async def test_peer_only_dialog_creates_and_notifies_once(tmp_path: Path) -> Non
         context.messages = context.messages[:1]
     await env.processor.process(env.chat)
     await env.processor.process(env.chat)
-    env.executor.execute_business.assert_awaited_once_with(
-        peer_intent().action, user_id=42
-    )
+    env.executor.execute_business.assert_awaited_once()
+    call = env.executor.execute_business.await_args
+    assert call.args == (peer_intent().action,)
+    assert call.kwargs["user_id"] == 42
+    # Provenance for the derived knowledge layer: the stored action identifies it.
+    assert call.kwargs["source_id"]
+    assert call.kwargs["now"].tzinfo is not None
     env.notify.assert_awaited_once_with(env.chat.title, "✅ Создана задача")
     assert await env.storage.cursor(owner_id=42, context_id=env.chat.id) == 1
 

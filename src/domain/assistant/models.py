@@ -5,6 +5,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.retrieval import EventQuery, TaskQuery
+from src.domain.knowledge.models import (
+    DEFAULT_KNOWLEDGE_RESULTS,
+    MAX_KNOWLEDGE_RESULTS,
+    KnowledgeText,
+)
 
 
 class DomainModel(BaseModel):
@@ -67,6 +72,23 @@ class SaveNoteAction(DomainModel):
     text: str
 
 
+class RememberKnowledgeAction(DomainModel):
+    """Store durable knowledge. The namespace is added by the backend."""
+
+    type: Literal[ActionType.REMEMBER_KNOWLEDGE]
+    content: KnowledgeText
+
+
+class SearchKnowledgeAction(DomainModel):
+    """Look knowledge up. The backend restricts the search to the current user."""
+
+    type: Literal[ActionType.SEARCH_KNOWLEDGE]
+    query: str = Field(min_length=1, max_length=400)
+    limit: int = Field(
+        default=DEFAULT_KNOWLEDGE_RESULTS, ge=1, le=MAX_KNOWLEDGE_RESULTS
+    )
+
+
 AssistantAction = Annotated[
     ChatAction
     | CreateTaskAction
@@ -78,7 +100,9 @@ AssistantAction = Annotated[
     | UpdateEventAction
     | DeleteEventAction
     | DeleteAllEventsAction
-    | SaveNoteAction,
+    | SaveNoteAction
+    | RememberKnowledgeAction
+    | SearchKnowledgeAction,
     Field(discriminator="type"),
 ]
 

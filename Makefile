@@ -2,7 +2,7 @@ UV ?= uv
 IMAGE_NAME ?= personal-ai-assistant
 CONTAINER_NAME ?= personal-ai-assistant
 
-.PHONY: install run lint format typecheck test eval check docker-build docker-run docker-remove docker-stop docker-logs
+.PHONY: install run lint format typecheck test test-integration eval eval-report check docker-build docker-run docker-remove docker-stop docker-logs knowledge-demo neo4j-up neo4j-down
 
 install:
 	$(UV) sync --all-groups
@@ -19,13 +19,19 @@ format:
 	$(UV) run ruff check . --fix
 
 typecheck:
-	$(UV) run --group eval mypy src tests evals
+	$(UV) run --group eval mypy src tests evals scripts
 
 test:
 	$(UV) run pytest --cov=src --cov-branch --cov-report=term-missing
 
+test-integration:
+	$(UV) run pytest tests/integration -m integration -v
+
 eval:
 	$(UV) run --group eval pytest evals --run-llm-evals -m llm_eval -v --junitxml=eval-results/junit.xml -o junit_family=xunit1
+
+eval-report:
+	$(UV) run --group eval python -m scripts.eval_report
 
 check: lint typecheck test
 
@@ -43,3 +49,12 @@ docker-stop:
 
 docker-logs:
 	docker logs --follow $(CONTAINER_NAME)
+
+neo4j-up:
+	docker compose up -d neo4j
+
+neo4j-down:
+	docker compose stop neo4j
+
+knowledge-demo:
+	$(UV) run python -m scripts.knowledge_demo

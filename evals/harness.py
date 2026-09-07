@@ -10,12 +10,14 @@ from src.application.services.explicit_commands import (
     parse_bulk_deletion,
     parse_view_request,
 )
+from src.application.services.knowledge import KnowledgeService
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.deletions import DeletionTarget
 from src.domain.assistant.models import AssistantDecision
 from src.domain.assistant.replies import AssistantReply
 from src.domain.assistant.retrieval import EventQuery, TaskQuery
 from src.domain.calendar.models import CalendarEvent
+from src.domain.knowledge.models import KnowledgeEpisode, KnowledgeFact
 from src.domain.tasks.models import CreatedTask, Task
 
 
@@ -222,15 +224,46 @@ class RecordingIntegrations:
 
 
 @dataclass
+class RecordingKnowledge:
+    """A graph frozen at the facts a scenario declares."""
+
+    facts: tuple[str, ...]
+
+    async def remember(self, *, namespace: str, episode: KnowledgeEpisode) -> None:
+        raise AssertionError("A recall scenario must not write to memory")
+
+    async def search(
+        self, *, namespace: str, query: str, limit: int
+    ) -> list[KnowledgeFact]:
+        return [KnowledgeFact(fact=fact) for fact in self.facts][:limit]
+
+    async def healthcheck(self) -> bool:
+        return True
+
+    async def close(self) -> None:
+        return None
+
+
+@dataclass
 class RecordingLLM:
     inner: LLMClient
     decision: AssistantDecision | None = None
 
     async def parse_message(
-        self, *, text: str, now: datetime, timezone: str, context: str = ""
+        self,
+        *,
+        text: str,
+        now: datetime,
+        timezone: str,
+        context: str = "",
+        knowledge: str = "",
     ) -> AssistantDecision:
         self.decision = await self.inner.parse_message(
-            text=text, now=now, timezone=timezone, context=context
+            text=text,
+            now=now,
+            timezone=timezone,
+            context=context,
+            knowledge=knowledge,
         )
         return self.decision
 
@@ -245,13 +278,20 @@ class EvaluationRun:
 async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
     integrations = RecordingIntegrations(scenario)
     recording_llm = RecordingLLM(llm)
+    knowledge = (
+        KnowledgeService(memory=RecordingKnowledge(scenario.knowledge_facts))
+        if scenario.knowledge_facts
+        else None
+    )
     use_case = ProcessMessageUseCase(
         llm=recording_llm,
         action_executor=ActionExecutor(
             calendar=integrations,
             pending_operations=integrations,
             task_tracker=integrations,
+            knowledge=knowledge,
         ),
+        knowledge=knowledge,
     )
     reply = await use_case.execute(
         text=scenario.prompt,

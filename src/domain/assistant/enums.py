@@ -13,3 +13,5 @@ class ActionType(StrEnum):
     DELETE_EVENT = "delete_event"
     DELETE_ALL_EVENTS = "delete_all_events"
     SAVE_NOTE = "save_note"
+    REMEMBER_KNOWLEDGE = "remember_knowledge"
+    SEARCH_KNOWLEDGE = "search_knowledge"

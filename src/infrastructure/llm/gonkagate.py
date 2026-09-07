@@ -11,6 +11,7 @@ from src.infrastructure.llm.business import business_input, business_instruction
 from src.infrastructure.llm.openai import (
     SUMMARY_PROMPT,
     SYSTEM_PROMPT,
+    answer_turn_suffix,
     message_with_context,
 )
 
@@ -36,6 +37,7 @@ class GonkaGateLLMClient:
         now: datetime,
         timezone: str,
         context: str = "",
+        knowledge: str = "",
     ) -> AssistantDecision:
         instructions = (
             f"{SYSTEM_PROMPT}\n\n"
@@ -59,6 +61,10 @@ class GonkaGateLLMClient:
             'Пример delete_all_events: {"actions":[{"type":"delete_all_events"}]}\n'
             'Пример save_note: {"actions":[{"type":"save_note",'
             '"text":"Люблю Python"}]}\n'
+            'Пример remember_knowledge: {"actions":[{"type":"remember_knowledge",'
+            '"content":"Пользователь хочет посмотреть Blade Runner"}]}\n'
+            'Пример search_knowledge: {"actions":[{"type":"search_knowledge",'
+            '"query":"фильм, который хотел посмотреть","limit":5}]}\n'
             f"Текущее время: {now.isoformat()}\n"
             f"Timezone пользователя: {timezone}"
             "\nПеред ответом проверь ВСЕ ограничения запроса: период, текст, статус, "
@@ -66,13 +72,17 @@ class GonkaGateLLMClient:
             "например, «по названию» — title, «сначала ближайший срок» — due asc.\n"
             "JSON schema ответа:\n"
             + json.dumps(AssistantDecision.model_json_schema(), ensure_ascii=False)
+            + answer_turn_suffix(knowledge)
         )
 
         response = await self._client.chat.completions.create(
             model=self._model,
             messages=[
                 {"role": "system", "content": instructions},
-                {"role": "user", "content": message_with_context(text, context)},
+                {
+                    "role": "user",
+                    "content": message_with_context(text, context, knowledge),
+                },
             ],
             response_format={"type": "json_object"},
         )

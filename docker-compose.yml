@@ -1,0 +1,49 @@
+services:
+  app:
+    build: .
+    image: ${IMAGE_NAME:-personal-ai-assistant}
+    container_name: ${CONTAINER_NAME:-personal-ai-assistant}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside the compose network Neo4j answers on its service name.
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+
+  neo4j:
+    image: neo4j:2026.07.1-community
+    container_name: ${CONTAINER_NAME:-personal-ai-assistant}-neo4j
+    restart: unless-stopped
+    ports:
+      # Neo4j Browser (7474) is a developer tool: bound to localhost only.
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      # Credentials come from .env; never hard-code them here.
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}"
+          "RETURN 1" || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+volumes:
+  app_data:
+  neo4j_data:
+  neo4j_logs:

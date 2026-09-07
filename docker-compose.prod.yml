@@ -1,0 +1,79 @@
+# Production stack for the deployment host.
+#
+# The image is built and tagged separately so every release keeps an immutable
+# tag and a rollback path:
+#
+#   RELEASE=<tag> docker compose -f docker-compose.prod.yml up -d
+#
+# Rolling back is the same command with the previous RELEASE tag.
+name: personal-ai-assistant
+
+services:
+  app:
+    image: personal-ai-assistant:${RELEASE:?set RELEASE to an existing image tag}
+    container_name: personal-ai-assistant
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Neo4j is reachable by service name inside the compose network.
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      # A host-networked reverse proxy forwards the public domain to this port.
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      neo4j:
+        condition: service_healthy
+        # Knowledge memory is optional: a broken Neo4j must not keep the bot down.
+        required: false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  neo4j:
+    image: neo4j:2026.07.1-community
+    container_name: personal-ai-assistant-neo4j
+    restart: unless-stopped
+    ports:
+      # Developer-only endpoints: never published beyond loopback.
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      # Sized for a 4 GB host: the bot must keep its memory headroom.
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    # Bounded so a heavy graph query can never starve the bot on this 4 GB host.
+    mem_limit: 1024m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}"
+          "RETURN 1" || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+volumes:
+  # The SQLite database predates compose: keep using the existing volume.
+  app_data:
+    name: personal-ai-assistant-data
+    external: true
+  neo4j_data:
+    name: personal-ai-assistant-neo4j-data
+  neo4j_logs:
+    name: personal-ai-assistant-neo4j-logs

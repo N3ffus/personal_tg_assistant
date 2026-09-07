@@ -217,7 +217,11 @@ class ProcessBusinessDialog:
                     try:
                         result = await asyncio.wait_for(
                             self._executor.execute_business(
-                                item.action, user_id=self._owner_id
+                                item.action,
+                                user_id=self._owner_id,
+                                # The stored action id is this note's provenance.
+                                now=datetime.now(ZoneInfo(self._timezone)),
+                                source_id=item.id,
                             ),
                             timeout=60,
                         )

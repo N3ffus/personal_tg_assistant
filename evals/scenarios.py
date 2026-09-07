@@ -15,6 +15,8 @@ class Scenario:
     tools: tuple[str, ...]
     expected: str
     reply_contains: tuple[str, ...] = ()
+    # Facts the long-term memory returns for any search this scenario triggers.
+    knowledge_facts: tuple[str, ...] = ()
     now: datetime = NOW
     timezone: str = "Europe/Moscow"
     user_id: int = 42
@@ -357,5 +359,30 @@ SCENARIOS = (
         "Не утверждать, что стоматолог создан.",
         ("календарь недоступен", "EVAL-1"),
         failure="calendar_error",
+    ),
+    Scenario(
+        "age_is_computed_from_the_remembered_birth_date",
+        "Сколько мне лет",
+        ({"type": "chat", "text": "Тебе 23 года."},),
+        (),
+        "Посчитать возраст арифметикой: 02.05.2003 и текущая дата 05.09.2026 дают 23 года. "
+        "Не называть другое число и не переспрашивать дату рождения.",
+        ("23",),
+        knowledge_facts=(
+            "Пользователь называется Васильев Андрей Сергеевич",
+            "Красноярск — город рождения Васильева Андрея Сергеевича (род. 02.05.2003).",
+        ),
+    ),
+    Scenario(
+        "a_missing_fact_is_never_invented",
+        "Сколько мне лет",
+        ({"type": "chat", "text": "Не знаю, ты не говорил дату рождения."},),
+        (),
+        "Память вернула факты, но даты рождения среди них нет. Прямо сказать, что возраст "
+        "неизвестен, и не называть никакого числа лет.",
+        knowledge_facts=(
+            "Пользователь называется Васильев Андрей Сергеевич",
+            "Пользователь работает с Python",
+        ),
     ),
 )

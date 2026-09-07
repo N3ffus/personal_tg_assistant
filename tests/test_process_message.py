@@ -44,6 +44,7 @@ async def test_process_message_parses_then_executes_decision() -> None:
         [action],
         user_id=42,
         now=now,
+        message_id=None,
     )
 
 
@@ -78,6 +79,7 @@ async def test_process_message_passes_all_actions_to_executor() -> None:
         actions,
         user_id=42,
         now=now,
+        message_id=None,
     )
 
 

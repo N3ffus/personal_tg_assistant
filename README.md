@@ -208,6 +208,203 @@ LLM определяет исполнителя и смысл реплик, по
 лимитом или очисткой, восстановить из него нельзя. Для сохранения важных фактов
 используйте `/compact` до достижения лимита.
 
+## Knowledge Memory
+
+Долговременная память бота — граф знаний на [Graphiti](https://github.com/getzep/graphiti)
+поверх Neo4j. Это **производный слой**: исходные сообщения и заметки остаются в
+SQLite, а Graphiti извлекает из них сущности, связи и факты с временем действия.
+
+```text
+Telegram
+   ↓
+Agent (ProcessMessageUseCase)
+   ↓
+KnowledgeMemory (порт) → KnowledgeService
+   ↓
+Graphiti
+   ↓
+Neo4j
+```
+
+Как это устроено:
+
+- **Episode** — исходный текст, который вы попросили запомнить. Имя эпизода
+  хранит происхождение факта: `telegram_message:<message_id>`, `note:<message_id>`
+  или `business_note:<action_id>`, а `source_description` — тип источника.
+- **Entity / Relationship** — сущности и связи, которые Graphiti извлекает сам.
+  Готовой онтологии нет: используется стандартное извлечение, типизированные
+  сущности можно добавить позже, не меняя порт.
+- **Temporal facts** — у факта есть `valid_at` и `invalid_at`. «В 2025 работаю в
+  A» и «в 2026 перешёл в B» не затирают друг друга: старый факт сохраняется с
+  датой окончания, а актуальным считается новый. Поэтому в память всегда
+  передаётся `reference_time` исходного сообщения, а не время записи в граф.
+- **group_id** — пространство имён пользователя. Оно вычисляется на бэкенде из
+  внутреннего идентификатора (`user_<uuid5>`), а не приходит от модели, и
+  подставляется в каждый `add_episode` и `search`. Telegram ID в граф не попадает.
+  Поиск без фильтра пространства имён не выполняется никогда.
+
+Что сохраняется: явные просьбы запомнить (`Запомни, что …`), заметки
+(`Сохрани заметку …`) и заметки, извлечённые из Business-диалогов. Системные
+промпты, схемы инструментов, рассуждения модели и результаты вызовов инструментов
+в граф не попадают.
+
+Агент работает с памятью двумя действиями:
+
+- `remember_knowledge` — сохранить факт; модель передаёт только текст.
+- `search_knowledge` — найти факты; пространство имён добавляет бэкенд.
+
+Поиск вызывается только когда ответ действительно зависит от памяти: «Какой фильм
+я хотел посмотреть?» обращается к графу, «Сколько будет 2 + 2?» — нет. Любой вопрос
+о самом пользователе память затрагивает, даже если ответ требует счёта: «Сколько
+мне лет» — это дата рождения из графа плюс арифметика от текущего времени.
+Найденные факты возвращаются модели вторым запросом в поле `recalled_knowledge`, и
+она отвечает уже с ними; этот второй вызов — проход ответа, повторный поиск в нём
+запрещён инструкцией. Если нужного факта среди найденного нет, модель обязана
+сказать об этом, а не подставлять правдоподобное число или дату.
+
+Используется встроенный гибридный поиск Graphiti (вектор + полнотекст + RRF) сразу
+по двум слоям графа — рёбрам и сущностям. Рёбер мало: извлечение часто оставляет
+деталь только в сводке сущности, и поиск по одним рёбрам её не видит. Сводки,
+дословно повторяющие факт ребра, отбрасываются, а оба слоя чередуются, чтобы лимит
+не вытеснил нужный. Собственного поиска поверх Neo4j нет.
+
+Память — необязательная зависимость. При `KNOWLEDGE_MEMORY_ENABLED=false` или
+недоступном Neo4j бот запускается и работает без памяти: в лог попадает
+`knowledge.startup.failed`, а инструменты памяти возвращают понятную ошибку
+вместо падения. Клиент Graphiti создаётся один раз на процесс и закрывается при
+остановке приложения.
+
+Настройки (см. `.env.example`):
+
+```env
+KNOWLEDGE_MEMORY_ENABLED=true
+NEO4J_URI=bolt://neo4j:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=change-me
+GRAPHITI_LLM_MODEL=
+GRAPHITI_LLM_API_KEY=
+GRAPHITI_LLM_BASE_URL=
+GRAPHITI_LLM_STRUCTURED_OUTPUT=json_schema
+GRAPHITI_EMBEDDING_MODEL=text-embedding-3-small
+GRAPHITI_EMBEDDING_DIM=1536
+GRAPHITI_EMBEDDING_API_KEY=
+GRAPHITI_EMBEDDING_BASE_URL=
+```
+
+Пустые `GRAPHITI_LLM_*` означают «использовать основного провайдера» (`LLM_*`).
+Задайте их, чтобы извлечение шло через отдельную дешёвую модель, а основной агент
+продолжал работать на сильной. Провайдер может быть любым OpenAI-совместимым.
+`GRAPHITI_LLM_STRUCTURED_OUTPUT=json_schema` даёт заметно более полное извлечение
+связей; переключайтесь на `json_object`, только если провайдер не поддерживает
+`json_schema`. `GRAPHITI_EMBEDDING_DIM` должен совпадать с размерностью выбранной
+модели эмбеддингов (например, у `BAAI/bge-m3` это 1024).
+
+### Running Neo4j
+
+```bash
+docker compose up -d neo4j
+```
+
+или `make neo4j-up`. Полный стек поднимается обычным `docker compose up -d`:
+приложение стартует только после того, как healthcheck Neo4j стал `healthy`.
+Данные лежат в volume `neo4j_data`, логи — в `neo4j_logs`, поэтому память
+переживает перезапуск контейнера и приложения.
+
+С host-машины Neo4j доступен как `bolt://localhost:7687`, изнутри docker-сети —
+как `bolt://neo4j:7687`.
+
+### Knowledge Graph Dashboard
+
+Neo4j Browser включён и открывается по адресу:
+
+```text
+http://localhost:7474/browser
+```
+
+| Параметр | Значение |
+| --- | --- |
+| Connect URL | `bolt://localhost:7687` |
+| Username | значение `NEO4J_USER` (по умолчанию `neo4j`) |
+| Password | значение `NEO4J_PASSWORD` из `.env` |
+
+Порты 7474 и 7687 в `docker-compose.yml` публикуются только на `127.0.0.1`:
+Neo4j Browser — инструмент разработчика, в production его наружу не выставляют.
+
+Готовые запросы:
+
+```cypher
+// Все узлы
+MATCH (n)
+RETURN n
+LIMIT 100;
+```
+
+```cypher
+// Связанный граф: сущности и извлечённые отношения
+MATCH p=(a)-[r]->(b)
+RETURN p
+LIMIT 100;
+```
+
+```cypher
+// Последние эпизоды с их происхождением
+MATCH (e)
+WHERE "Episodic" IN labels(e)
+RETURN e.name, e.source_description, e.valid_at, e.created_at
+ORDER BY e.created_at DESC
+LIMIT 50;
+```
+
+```cypher
+// Данные одного пользователя: подставьте его group_id
+MATCH p=(a)-[r]->(b)
+WHERE a.group_id = 'user_00000000-0000-0000-0000-000000000000'
+RETURN p
+LIMIT 100;
+```
+
+```cypher
+// История факта: что было верно раньше и что верно сейчас
+MATCH ()-[r:RELATES_TO]->()
+WHERE r.group_id = 'user_00000000-0000-0000-0000-000000000000'
+RETURN r.fact, r.valid_at, r.invalid_at
+ORDER BY r.valid_at DESC;
+```
+
+`group_id` конкретного пользователя печатает `make knowledge-demo`.
+
+### Демо
+
+```bash
+docker compose up -d neo4j
+make knowledge-demo
+```
+
+Скрипт добавляет несколько эпизодов про Kafka, Python и AI-агентов, выполняет по
+ним поиск, печатает найденные факты с их периодами действия и источником, а затем
+показывает готовый Cypher-запрос для просмотра графа в Neo4j Browser.
+
+### Проверка remember → search
+
+```text
+Вы:  Запомни, что я хочу посмотреть Blade Runner
+Бот: 🧠 Запомнил: Пользователь хочет посмотреть Blade Runner
+
+Вы:  Какой фильм я хотел посмотреть?
+Бот: Blade Runner
+```
+
+### Troubleshooting
+
+| Симптом | Причина и что делать |
+| --- | --- |
+| `knowledge.startup.failed` в логе, память отключена | Neo4j не поднят или недоступен по `NEO4J_URI`. Проверьте `docker compose ps` и healthcheck контейнера. Бот при этом продолжает работать. |
+| `The client is unauthorized due to authentication failure` | `NEO4J_PASSWORD` не совпадает с паролем в volume. Пароль задаётся при первом старте: смените его в базе или удалите volume `neo4j_data` (память будет потеряна). |
+| Инструменты отвечают «Долговременная память сейчас недоступна» | Neo4j упал уже после старта. Агент продолжает отвечать без памяти; поднимите Neo4j и повторите запрос. |
+| `knowledge.remember.failed` с ошибкой провайдера | Недоступен или неверно настроен `GRAPHITI_LLM_*`. Проверьте ключ, базовый URL и что модель поддерживает выбранный `GRAPHITI_LLM_STRUCTURED_OUTPUT`. |
+| Ошибка размерности вектора при поиске | `GRAPHITI_EMBEDDING_DIM` не совпадает с моделью эмбеддингов или её сменили после наполнения графа. Приведите размерность в соответствие; при смене модели граф нужно перестроить. |
+| Граф пустой, поиск ничего не находит | Эпизоды сохранены, но связи не извлечены. Проверьте `MATCH (e) WHERE "Episodic" IN labels(e) RETURN e`: если эпизоды есть, а рёбер `RELATES_TO` нет, переключите `GRAPHITI_LLM_STRUCTURED_OUTPUT` на `json_schema` или возьмите более сильную модель извлечения. |
+
 ## Google Calendar
 
 Создайте OAuth Client ID типа **Web application** в Google Cloud Console, включите
@@ -281,6 +478,34 @@ make docker-stop
 
 Для запуска нужен работающий Docker Engine (Docker Desktop на Windows).
 
+### Продакшн
+
+`docker-compose.prod.yml` рассчитан на сервер: он не собирает образ, а запускает
+уже собранный с неизменяемым тегом релиза, поэтому откат — это тот же запуск с
+предыдущим тегом.
+
+```bash
+docker build --tag personal-ai-assistant:<release> .
+RELEASE=<release> docker compose -f docker-compose.prod.yml up -d
+```
+
+Отличия от dev-варианта: публикация порта только на loopback (за ним reverse proxy),
+внешний volume `personal-ai-assistant-data` с SQLite-базой, ограничения памяти
+Neo4j под небольшой хост и `depends_on: required: false` — недоступный Neo4j
+отключает память, но не мешает боту работать.
+
+Neo4j Browser опубликован только на loopback. Чтобы открыть его с ноутбука,
+пробросьте порты через SSH:
+
+```bash
+ssh -L 7474:127.0.0.1:7474 -L 7687:127.0.0.1:7687 <host>
+```
+
+и откройте `http://localhost:7474/browser`.
+
+`docker compose up -d` поднимает бота вместе с Neo4j для графа знаний: см.
+раздел [Knowledge Memory](#knowledge-memory).
+
 ## Разработка
 
 `Makefile` использует `uv`, поэтому команды работают одинаково в Windows, Linux и macOS.
@@ -293,12 +518,17 @@ make docker-stop
 | `make format` | Отформатировать код и применить безопасные исправления Ruff |
 | `make typecheck` | Запустить строгую проверку типов mypy |
 | `make test` | Запустить pytest с branch coverage и обязательным порогом 90% |
+| `make test-integration` | Прогнать live-тесты памяти против запущенного Neo4j и LLM-провайдера |
 | `make eval` | Оценить сценарии промптов и интеграций через DeepEval и DeepInfra GLM-5.3-Flash |
+| `make eval-report` | Собрать PDF с абсолютными баллами последнего прогона в `eval-results/deepeval-report.pdf` |
 | `make check` | Запустить все проверки: Ruff, mypy и pytest |
 | `make docker-build` | Собрать Docker-образ `personal-ai-assistant` |
 | `make docker-run` | Собрать и запустить бота в Docker с `.env` |
 | `make docker-logs` | Следить за логами контейнера |
 | `make docker-stop` | Остановить контейнер |
+| `make neo4j-up` | Поднять Neo4j для графа знаний |
+| `make neo4j-down` | Остановить Neo4j |
+| `make knowledge-demo` | Наполнить граф демо-эпизодами и выполнить по ним поиск |
 
 Перед отправкой изменений выполните:
 
@@ -320,8 +550,10 @@ pip-audit. Результаты последнего предрелизного 
 src/
 ├── application/    # use cases, сервисы и порты
 ├── domain/         # модели и типы действий
-├── infrastructure/ # реализации LLM- и Telegram-адаптеров
+├── infrastructure/ # реализации LLM-, Telegram- и Graphiti-адаптеров
 ├── config.py       # настройки окружения
 └── main.py         # запуск приложения
 tests/              # автоматические тесты
+tests/integration/  # live-тесты графа знаний (Neo4j + LLM)
+scripts/            # dev-утилиты, включая knowledge-demo
 ```

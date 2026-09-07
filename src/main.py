@@ -8,6 +8,7 @@ from src.application.services.action_executor import (
     ActionExecutor,
 )
 from src.application.services.context import ContextService
+from src.application.services.knowledge import KnowledgeService
 from src.application.use_cases.process_business_dialog import ProcessBusinessDialog
 from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
@@ -18,6 +19,7 @@ from src.infrastructure.calendar.oauth import GoogleOAuthService, create_oauth_a
 from src.infrastructure.calendar.storage import CalendarStorage
 from src.infrastructure.context.business_storage import BusinessStorage
 from src.infrastructure.context.storage import ContextStorage
+from src.infrastructure.knowledge.factory import create_knowledge_service
 from src.infrastructure.llm.gonkagate import (
     GonkaGateLLMClient,
 )
@@ -78,6 +80,7 @@ async def main() -> None:
     task_tracker: LinearTaskClient | None = None
     bot: Bot | None = None
     business_worker: BusinessDialogWorker | None = None
+    knowledge: KnowledgeService | None = None
     try:
         storage = CalendarStorage(
             database_path=settings.database_path,
@@ -102,10 +105,14 @@ async def main() -> None:
             team_id=settings.linear_team_id,
         )
 
+        # One Graphiti client per process; a missing Neo4j only disables memory.
+        knowledge = await create_knowledge_service(settings)
+
         action_executor = ActionExecutor(
             calendar=calendar,
             pending_operations=storage,
             task_tracker=task_tracker,
+            knowledge=knowledge,
         )
 
         bot = Bot(token=settings.telegram_bot_token.get_secret_value())
@@ -132,6 +139,7 @@ async def main() -> None:
             llm=llm,
             action_executor=action_executor,
             contexts=contexts,
+            knowledge=knowledge,
         )
 
         dispatcher = Dispatcher()
@@ -172,7 +180,7 @@ async def main() -> None:
 
         server = uvicorn.Server(
             uvicorn.Config(
-                create_oauth_app(oauth=oauth),
+                create_oauth_app(oauth=oauth, knowledge=knowledge),
                 host=settings.http_host,
                 port=settings.http_port,
                 log_level="info",
@@ -184,14 +192,18 @@ async def main() -> None:
         if business_worker is not None:
             await business_worker.close()
         try:
-            if task_tracker is not None:
-                await task_tracker.close()
+            if knowledge is not None:
+                await knowledge.close()
         finally:
             try:
-                await llm.close()
+                if task_tracker is not None:
+                    await task_tracker.close()
             finally:
-                if bot is not None:
-                    await bot.session.close()
+                try:
+                    await llm.close()
+                finally:
+                    if bot is not None:
+                        await bot.session.close()
 
 
 if __name__ == "__main__":

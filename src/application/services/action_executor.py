@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from datetime import datetime, timedelta, tzinfo
 from html import escape
@@ -8,12 +9,14 @@ from src.application.ports.calendar import (
     CalendarNotConnectedError,
     PendingOperationStore,
 )
+from src.application.ports.knowledge import KnowledgeMemoryError
 from src.application.ports.tasks import (
     TaskCreationUncertainError,
     TaskTrackerClient,
     TaskTrackerError,
 )
 from src.application.services.deletions import DeletionService
+from src.application.services.knowledge import KnowledgeService
 from src.application.services.retrieval import RetrievalService
 from src.domain.assistant.business import (
     BusinessAction,
@@ -32,13 +35,20 @@ from src.domain.assistant.models import (
     DeleteTaskAction,
     ListEventsAction,
     ListTasksAction,
+    RememberKnowledgeAction,
     SaveNoteAction,
+    SearchKnowledgeAction,
     UpdateEventAction,
 )
 from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
 from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
 from src.domain.calendar.models import CalendarEvent
+from src.domain.knowledge.models import KnowledgeFact, KnowledgeSourceType
 from src.domain.tasks.models import Task
+
+logger = logging.getLogger(__name__)
+
+MEMORY_UNAVAILABLE = "⚠️ Долговременная память сейчас недоступна, попробуйте позже."
 
 
 class ActionExecutor:
@@ -48,16 +58,25 @@ class ActionExecutor:
         calendar: CalendarClient,
         pending_operations: PendingOperationStore,
         task_tracker: TaskTrackerClient,
+        knowledge: KnowledgeService | None = None,
     ) -> None:
         self._calendar = calendar
         self._pending_operations = pending_operations
         self._task_tracker = task_tracker
+        self._knowledge = knowledge
         self._retrieval = RetrievalService(calendar=calendar, task_tracker=task_tracker)
         self._deletions = DeletionService(
             calendar=calendar, task_tracker=task_tracker, storage=pending_operations
         )
 
-    async def execute_business(self, action: BusinessAction, *, user_id: int) -> str:
+    async def execute_business(
+        self,
+        action: BusinessAction,
+        *,
+        user_id: int,
+        now: datetime | None = None,
+        source_id: str | None = None,
+    ) -> str:
         # Deliberately separate from execute(): business input cannot reach destructive actions.
         if isinstance(action, BusinessTask):
             task = await self._task_tracker.create_task(title=action.title)
@@ -77,8 +96,37 @@ class ActionExecutor:
             )
         if isinstance(action, BusinessNote):
             # The caller commits the encrypted note before delivering this notification.
+            await self._remember_quietly(
+                content=action.text,
+                user_id=user_id,
+                now=now,
+                source_id=source_id,
+            )
             return f"📝 Сохранена заметка: {escape(action.text)}"
         raise ValueError("Forbidden business action")
+
+    async def _remember_quietly(
+        self,
+        *,
+        content: str,
+        user_id: int,
+        now: datetime | None,
+        source_id: str | None,
+    ) -> None:
+        """Feed a stored note into memory without ever failing its delivery."""
+        if self._knowledge is None or now is None or source_id is None:
+            return
+        try:
+            await self._remember(
+                content=content,
+                user_id=user_id,
+                now=now,
+                message_id=None,
+                source_type=KnowledgeSourceType.BUSINESS_NOTE,
+                source_id=source_id,
+            )
+        except KnowledgeMemoryError as error:
+            logger.warning("knowledge.remember.skipped reason=%s", error)
 
     async def resolve_deletion(
         self, *, user_id: int, operation_id: str, confirm: bool
@@ -93,6 +141,7 @@ class ActionExecutor:
         *,
         user_id: int,
         now: datetime,
+        message_id: int | None = None,
     ) -> str | AssistantReply:
         if not actions:
             raise ValueError("At least one action is required")
@@ -102,7 +151,9 @@ class ActionExecutor:
         pages: list[ResultPage] = []
         for action in actions:
             try:
-                response = await self.execute(action, user_id=user_id, now=now)
+                response = await self.execute(
+                    action, user_id=user_id, now=now, message_id=message_id
+                )
             except (RetrievalLimitError, TimeoutError):
                 if not isinstance(action, (ListTasksAction, ListEventsAction)):
                     raise
@@ -125,6 +176,13 @@ class ActionExecutor:
                     )
                 else:
                     raise
+            except KnowledgeMemoryError:
+                if not isinstance(
+                    action,
+                    (RememberKnowledgeAction, SearchKnowledgeAction, SaveNoteAction),
+                ):
+                    raise
+                response = MEMORY_UNAVAILABLE
             except CalendarNotConnectedError:
                 if not self._is_calendar_action(action):
                     raise
@@ -161,6 +219,7 @@ class ActionExecutor:
         *,
         user_id: int,
         now: datetime,
+        message_id: int | None = None,
     ) -> str | AssistantReply:
         if isinstance(action, ChatAction):
             return action.text
@@ -228,9 +287,80 @@ class ActionExecutor:
             )
 
         if isinstance(action, SaveNoteAction):
-            return f"📝 Понял, нужно сохранить заметку:\n{action.text}"
+            stored = await self._remember(
+                content=action.text,
+                user_id=user_id,
+                now=now,
+                message_id=message_id,
+                source_type=KnowledgeSourceType.NOTE,
+            )
+            prefix = "Заметка сохранена" if stored else "Понял, нужно сохранить заметку"
+            return f"📝 {prefix}:\n{action.text}"
+
+        if isinstance(action, RememberKnowledgeAction):
+            if self._knowledge is None:
+                return "⚠️ Долговременная память отключена, сохранить факт не могу."
+            await self._remember(
+                content=action.content,
+                user_id=user_id,
+                now=now,
+                message_id=message_id,
+            )
+            return f"🧠 Запомнил: {action.content}"
+
+        if isinstance(action, SearchKnowledgeAction):
+            if self._knowledge is None:
+                return "⚠️ Долговременная память отключена, поиск по ней недоступен."
+            facts = await self._knowledge.search(
+                user_id=user_id, query=action.query, limit=action.limit
+            )
+            return self.format_facts(facts)
 
         raise ValueError(f"Unsupported action: {type(action)!r}")
+
+    async def _remember(
+        self,
+        *,
+        content: str,
+        user_id: int,
+        now: datetime,
+        message_id: int | None,
+        source_type: KnowledgeSourceType = KnowledgeSourceType.TELEGRAM_MESSAGE,
+        source_id: str | None = None,
+    ) -> bool:
+        """Persist user-authored knowledge; returns whether memory accepted it."""
+        if self._knowledge is None:
+            return False
+        await self._knowledge.remember(
+            user_id=user_id,
+            content=content,
+            source_id=source_id or self._source_id(message_id=message_id, now=now),
+            source_type=source_type,
+            # The message time is the moment the user stated the fact.
+            reference_time=now,
+        )
+        return True
+
+    @staticmethod
+    def _source_id(*, message_id: int | None, now: datetime) -> str:
+        return str(message_id) if message_id is not None else f"{now:%Y%m%dT%H%M%S%z}"
+
+    @staticmethod
+    def format_facts(facts: list[KnowledgeFact]) -> str:
+        if not facts:
+            return "🧠 В долговременной памяти ничего не нашлось по этому запросу."
+        lines = ["🧠 Нашёл в памяти:"]
+        for fact in facts:
+            line = f"• {fact.fact}"
+            if fact.valid_from:
+                line += f" (с {fact.valid_from:%d.%m.%Y}"
+                line += (
+                    f", до {fact.valid_until:%d.%m.%Y})" if fact.valid_until else ")"
+                )
+            elif fact.valid_until:
+                line += f" (до {fact.valid_until:%d.%m.%Y})"
+            lines.append(line)
+        return "\n".join(lines)
 
     @staticmethod
     def format_tasks(tasks: list[Task]) -> str:
