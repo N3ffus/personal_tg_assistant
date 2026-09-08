@@ -1,6 +1,7 @@
 import logging
-from datetime import UTC
+from datetime import UTC, datetime
 from itertools import zip_longest
+from typing import Any
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -36,6 +37,23 @@ SEARCH_CONFIG = SearchConfig(
     episode_config=COMBINED_HYBRID_SEARCH_RRF.episode_config,
 )
 
+# A date never becomes an entity, so an edge like HAS_DATE_OF_BIRTH loses its
+# target and is dropped: "родился 02.05.2003" can only survive in the episode.
+# Episode search is BM25 — "дата рождения" does not match "родился" — so the
+# adapter embeds every episode itself and recalls it by meaning.
+EPISODE_SIMILARITY = """
+MATCH (episode:Episodic {group_id: $namespace})
+WHERE episode.content_embedding IS NOT NULL
+WITH episode,
+     vector.similarity.cosine(episode.content_embedding, $embedding) AS score
+WHERE score >= $min_score
+RETURN episode.name AS name, episode.content AS content,
+       episode.valid_at AS valid_at
+ORDER BY score DESC LIMIT $limit
+"""
+# Unrelated Russian sentences sit well below this; paraphrases sit above it.
+MIN_EPISODE_SIMILARITY = 0.5
+
 EPISODE_TYPES: dict[KnowledgeSourceType, EpisodeType] = {
     # Conversational material keeps speaker attribution; notes are plain text.
     KnowledgeSourceType.TELEGRAM_MESSAGE: EpisodeType.message,
@@ -65,7 +83,7 @@ class GraphitiKnowledgeMemory:
             else episode.content
         )
         try:
-            await self._graphiti.add_episode(
+            results = await self._graphiti.add_episode(
                 name=episode.name,
                 episode_body=body,
                 source=source,
@@ -78,6 +96,26 @@ class GraphitiKnowledgeMemory:
             )
         except Exception as error:
             raise KnowledgeMemoryError(_reason(error)) from error
+        await self._embed_episode(uuid=results.episode.uuid, content=body)
+
+    async def _embed_episode(self, *, uuid: str, content: str) -> None:
+        """Attach the vector that makes this episode findable by meaning.
+
+        The episode is already stored, so a failing embedder degrades recall to
+        keyword search instead of losing the fact.
+        """
+        try:
+            embedding = await self._graphiti.embedder.create(input_data=content)
+            await self._graphiti.driver.execute_query(
+                "MATCH (episode:Episodic {uuid: $uuid}) "
+                "SET episode.content_embedding = $embedding",
+                uuid=uuid,
+                embedding=embedding,
+            )
+        except Exception as error:
+            logger.warning(
+                "knowledge.embed.failed uuid=%s reason=%s", uuid, _reason(error)
+            )
 
     async def search(
         self, *, namespace: str, query: str, limit: int
@@ -133,7 +171,43 @@ class GraphitiKnowledgeMemory:
                     fact=text, valid_from=episode.valid_at, source=episode.name
                 )
             )
-        return _interleaved(edge_facts, node_facts, episode_facts)[:limit]
+        similar = await self._similar_episodes(
+            namespace=namespace, query=query, limit=limit, seen=seen
+        )
+        return _interleaved(edge_facts, node_facts, episode_facts, similar)[:limit]
+
+    async def _similar_episodes(
+        self, *, namespace: str, query: str, limit: int, seen: set[str]
+    ) -> list[KnowledgeFact]:
+        """Recall episodes whose meaning matches, not whose words do."""
+        try:
+            embedding = await self._graphiti.embedder.create(input_data=query)
+            rows, _, _ = await self._graphiti.driver.execute_query(
+                EPISODE_SIMILARITY,
+                namespace=namespace,
+                embedding=embedding,
+                min_score=MIN_EPISODE_SIMILARITY,
+                limit=limit,
+                routing_="r",
+            )
+        except Exception as error:
+            # Keyword recall already ran: degrade to it rather than lose the answer.
+            logger.warning("knowledge.embed.failed query reason=%s", _reason(error))
+            return []
+        facts: list[KnowledgeFact] = []
+        for row in rows:
+            text = _without_speaker(row["content"])
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            facts.append(
+                KnowledgeFact(
+                    fact=text,
+                    valid_from=_as_datetime(row["valid_at"]),
+                    source=row["name"],
+                )
+            )
+        return facts
 
     async def healthcheck(self) -> bool:
         try:
@@ -162,6 +236,15 @@ class GraphitiKnowledgeMemory:
             for episode in episodes
             if episode.group_id == namespace
         }
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """Convert the driver's own temporal type; Graphiti's models do it for us."""
+    if isinstance(value, datetime):
+        return value
+    to_native = getattr(value, "to_native", None)
+    converted = to_native() if callable(to_native) else None
+    return converted if isinstance(converted, datetime) else None
 
 
 def _without_speaker(content: str) -> str:

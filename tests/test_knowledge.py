@@ -109,6 +109,8 @@ class FakeGraphiti:
         edges: list[SimpleNamespace] | None = None,
         nodes: list[SimpleNamespace] | None = None,
         found_episodes: list[SimpleNamespace] | None = None,
+        similar: list[dict[str, Any]] | None = None,
+        embedding_error: Exception | None = None,
         error: Exception | None = None,
     ) -> None:
         self.edges = edges or []
@@ -119,17 +121,31 @@ class FakeGraphiti:
         self.searches: list[dict[str, Any]] = []
         self.closed = False
         self.indices_built = False
-        self.driver = SimpleNamespace(execute_query=AsyncMock(return_value=None))
+        self.similar = similar or []
+        self.embedder = SimpleNamespace(
+            create=AsyncMock(return_value=embedding_error or [0.1, 0.2, 0.3])
+        )
+        if isinstance(embedding_error, Exception):
+            self.embedder.create = AsyncMock(side_effect=embedding_error)
+        self.queries: list[dict[str, Any]] = []
+        self.driver = SimpleNamespace(execute_query=self._execute_query)
+
+    async def _execute_query(
+        self, query: str, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], None, None]:
+        self.queries.append({"query": query, **kwargs})
+        return (self.similar if "vector.similarity" in query else [], None, None)
 
     async def build_indices_and_constraints(self) -> None:
         if self.error:
             raise self.error
         self.indices_built = True
 
-    async def add_episode(self, **kwargs: Any) -> None:
+    async def add_episode(self, **kwargs: Any) -> SimpleNamespace:
         if self.error:
             raise self.error
         self.episodes.append(kwargs)
+        return SimpleNamespace(episode=SimpleNamespace(uuid="episode-uuid"))
 
     async def search_(self, **kwargs: Any) -> SimpleNamespace:
         if self.error:
@@ -517,6 +533,114 @@ async def test_adapter_drops_an_episode_that_only_repeats_a_fact(
     facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
 
     assert [fact.fact for fact in facts] == ["Работает с Python"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_embeds_the_episode_it_stores() -> None:
+    """Dates never become edges, so the episode must be searchable by meaning."""
+    graphiti = FakeGraphiti()
+
+    await memory(graphiti).remember(
+        namespace="user_abc",
+        episode=KnowledgeEpisode(
+            content="Пользователь родился 02.05.2003",
+            source_id="627",
+            source_type=KnowledgeSourceType.TELEGRAM_MESSAGE,
+            reference_time=NOW,
+        ),
+    )
+
+    graphiti.embedder.create.assert_awaited_once()
+    written = [query for query in graphiti.queries if "content_embedding" in query["query"]]
+    assert len(written) == 1
+    assert written[0]["uuid"] == "episode-uuid"
+    assert written[0]["embedding"] == [0.1, 0.2, 0.3]
+
+
+@pytest.mark.asyncio
+async def test_adapter_keeps_the_episode_when_embedding_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fact is already stored; losing its vector must not lose the write."""
+    graphiti = FakeGraphiti(embedding_error=RuntimeError("embedder down"))
+
+    with caplog.at_level(logging.WARNING):
+        await memory(graphiti).remember(
+            namespace="user_abc",
+            episode=KnowledgeEpisode(
+                content="Факт",
+                source_id="1",
+                source_type=KnowledgeSourceType.NOTE,
+                reference_time=NOW,
+            ),
+        )
+
+    assert len(graphiti.episodes) == 1
+    assert any(
+        record.getMessage().startswith("knowledge.embed.failed")
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_recalls_episodes_by_meaning() -> None:
+    """«дата рождения» never matches «родился» by words, only by vector."""
+    graphiti = FakeGraphiti(
+        similar=[
+            {
+                "name": "telegram_message:627",
+                "content": "Пользователь: Пользователь родился 02.05.2003",
+                "valid_at": NOW,
+            }
+        ]
+    )
+
+    facts = await memory(graphiti).search(
+        namespace="user_abc", query="дата рождения", limit=5
+    )
+
+    assert facts == [
+        KnowledgeFact(
+            fact="Пользователь родился 02.05.2003",
+            valid_from=NOW,
+            source="telegram_message:627",
+        )
+    ]
+    vector = [query for query in graphiti.queries if "vector.similarity" in query["query"]]
+    assert vector[0]["namespace"] == "user_abc"
+
+
+@pytest.mark.asyncio
+async def test_adapter_never_repeats_an_episode_found_both_ways() -> None:
+    graphiti = FakeGraphiti(
+        found_episodes=[found_episode(content="Пользователь: Один факт", group_id="user_abc")],
+        similar=[{"name": "telegram_message:627", "content": "Пользователь: Один факт", "valid_at": NOW}],
+    )
+
+    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
+
+    assert [fact.fact for fact in facts] == ["Один факт"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_still_recalls_when_the_query_cannot_be_embedded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    graphiti = FakeGraphiti(
+        edges=[edge(fact="Работает с Python", group_id="user_abc", episodes=[])],
+        embedding_error=RuntimeError("embedder down"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        facts = await memory(graphiti).search(
+            namespace="user_abc", query="работа", limit=5
+        )
+
+    assert [fact.fact for fact in facts] == ["Работает с Python"]
+    assert any(
+        record.getMessage().startswith("knowledge.embed.failed")
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
