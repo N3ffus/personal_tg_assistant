@@ -95,11 +95,12 @@ class SearchKnowledgeAction(DomainModel):
 # A batch has to outnumber what the user asked for: most of it is filtered out
 # against a catalogue of hundreds of watched films.
 MAX_FILM_CANDIDATES = 30
+MAX_FILM_ALIASES = 8
 
 
 class FilmCandidate(DomainModel):
     title: str = Field(min_length=1, max_length=200)
-    aliases: list[str] = Field(default_factory=list, max_length=8)
+    aliases: list[str] = Field(default_factory=list, max_length=MAX_FILM_ALIASES)
     # Shown to the user: a renamed or invented film is obvious next to its year.
     year: int | None = Field(default=None, ge=1888, le=2100)
     # A blank reason must not invalidate the whole decision: the model dropped

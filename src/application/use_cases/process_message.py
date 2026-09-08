@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
 
+from src.application.ports.films import FilmDirectory
 from src.application.ports.knowledge import KnowledgeMemoryError
 from src.application.ports.llm import LLMClient
 from src.application.services.action_executor import (
@@ -16,15 +18,17 @@ from src.application.services.knowledge import KnowledgeService
 from src.domain.assistant.context import ContextMessage
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
+    MAX_FILM_ALIASES,
     MAX_FILM_CANDIDATES,
     AssistantAction,
     AssistantDecision,
     ChatAction,
+    FilmCandidate,
     RecommendFilmsAction,
     SearchKnowledgeAction,
 )
 from src.domain.assistant.replies import AssistantReply, ResultPage
-from src.domain.knowledge.films import select_unwatched, title_keys
+from src.domain.knowledge.films import FilmRecord, select_unwatched, title_keys
 from src.domain.knowledge.models import KnowledgeFact
 
 logger = logging.getLogger(__name__)
@@ -38,11 +42,13 @@ class ProcessMessageUseCase:
         action_executor: ActionExecutor,
         contexts: ContextService | None = None,
         knowledge: KnowledgeService | None = None,
+        films: FilmDirectory | None = None,
     ) -> None:
         self._llm = llm
         self._action_executor = action_executor
         self._contexts = contexts
         self._knowledge = knowledge
+        self._films = films
 
     async def execute(
         self,
@@ -256,23 +262,23 @@ class ProcessMessageUseCase:
         except KnowledgeMemoryError as error:
             logger.warning("films.topup.skipped reason=%s", error)
             return action
-        survivors = select_unwatched(
-            action.candidates, watched=watched, limit=action.limit
-        )
+        # Verification comes first: it also rewrites a loose title to the one the
+        # directory knows, which is what the watched catalogue is spelled in.
+        real = await self._verified(action.candidates)
+        survivors = select_unwatched(real, watched=watched, limit=action.limit)
         logger.info(
-            "films.recommend.proposed candidates=%s unwatched=%s limit=%s",
+            "films.recommend.proposed candidates=%s real=%s unwatched=%s limit=%s",
             len(action.candidates),
+            len(real),
             len(survivors),
             action.limit,
         )
         if not watched or len(survivors) >= action.limit:
-            return action
+            return action.model_copy(update={"candidates": survivors or real})
         kept = {id(candidate) for candidate in survivors}
         rejected = [
-            candidate.title
-            for candidate in action.candidates
-            if id(candidate) not in kept
-        ]
+            candidate.title for candidate in real if id(candidate) not in kept
+        ] or [candidate.title for candidate in action.candidates]
         retry = KnowledgeFact(
             fact="Эти кандидаты уже просмотрены и отклонены, предложи другие фильмы: "
             + ", ".join(rejected)
@@ -286,15 +292,58 @@ class ProcessMessageUseCase:
             ),
             **({"context": context} if context else {}),
         )
-        extra = [
-            candidate
-            for other in second.actions
-            if isinstance(other, RecommendFilmsAction)
-            for candidate in other.candidates
-        ]
-        return action.model_copy(
-            update={"candidates": [*survivors, *extra][:MAX_FILM_CANDIDATES]}
+        extra = await self._verified(
+            [
+                candidate
+                for other in second.actions
+                if isinstance(other, RecommendFilmsAction)
+                for candidate in other.candidates
+            ]
         )
+        topped_up = [*survivors, *extra][:MAX_FILM_CANDIDATES]
+        # An action must always carry a candidate; the executor reports an empty
+        # result in the one voice the user sees for it.
+        return action.model_copy(update={"candidates": topped_up or action.candidates})
+
+    async def _verified(self, candidates: list[FilmCandidate]) -> list[FilmCandidate]:
+        """Drop candidates no film directory knows, and canonicalise the rest.
+
+        The model renames a watched film to slip it past the catalogue and
+        invents titles outright; nothing inside the application can tell those
+        from real films. A directory failure degrades to the unverified batch:
+        an unchecked recommendation beats no answer at all.
+        """
+        if self._films is None or not candidates:
+            return candidates
+        found = await asyncio.gather(
+            *(
+                self._films.find(title=candidate.title, year=candidate.year)
+                for candidate in candidates
+            ),
+            return_exceptions=True,
+        )
+        for record in found:
+            if isinstance(record, BaseException):
+                # A partly checked batch would drop real films on a network blip.
+                logger.warning("films.directory.degraded reason=%s", record)
+                return candidates
+        verified: list[FilmCandidate] = []
+        for candidate, record in zip(candidates, found, strict=True):
+            if not isinstance(record, FilmRecord):
+                logger.info("films.candidate.unknown title=%r", candidate.title)
+                continue
+            verified.append(
+                candidate.model_copy(
+                    update={
+                        "title": record.title,
+                        "year": record.year or candidate.year,
+                        "aliases": [*candidate.aliases, record.original_title][
+                            :MAX_FILM_ALIASES
+                        ],
+                    }
+                )
+            )
+        return verified
 
     async def _recall(
         self, searches: list[SearchKnowledgeAction], *, user_id: int

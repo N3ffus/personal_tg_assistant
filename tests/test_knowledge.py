@@ -11,6 +11,7 @@ from cryptography.fernet import Fernet
 from graphiti_core.nodes import EpisodeType
 from pydantic import ValidationError
 
+from src.application.ports.films import FilmDirectoryError
 from src.application.ports.knowledge import KnowledgeMemoryError
 from src.application.services.action_executor import (
     MEMORY_UNAVAILABLE,
@@ -29,7 +30,12 @@ from src.domain.assistant.models import (
     SaveNoteAction,
     SearchKnowledgeAction,
 )
-from src.domain.knowledge.films import select_unwatched, title_keys
+from src.domain.knowledge.films import (
+    FilmRecord,
+    select_unwatched,
+    title_key,
+    title_keys,
+)
 from src.domain.knowledge.models import (
     KnowledgeEpisode,
     KnowledgeFact,
@@ -1220,6 +1226,7 @@ def use_case(
     *,
     decisions: list[AssistantDecision],
     knowledge: KnowledgeService | None,
+    films: object | None = None,
 ) -> tuple[ProcessMessageUseCase, SimpleNamespace, SimpleNamespace]:
     llm = SimpleNamespace(parse_message=AsyncMock(side_effect=decisions))
     action_executor = SimpleNamespace(execute_many=AsyncMock(return_value="Ответ"))
@@ -1228,10 +1235,25 @@ def use_case(
             llm=llm,
             action_executor=action_executor,  # type: ignore[arg-type]
             knowledge=knowledge,
+            films=films,  # type: ignore[arg-type]
         ),
         llm,
         action_executor,
     )
+
+
+def known(*films: FilmRecord) -> SimpleNamespace:
+    """A directory that knows exactly these films, by either title."""
+    by_key = {
+        title_key(title): record
+        for record in films
+        for title in (record.title, record.original_title)
+    }
+
+    async def find(*, title: str, year: int | None) -> FilmRecord | None:
+        return by_key.get(title_key(title))
+
+    return SimpleNamespace(find=find, close=AsyncMock())
 
 
 def chat(text: str) -> AssistantDecision:
@@ -1282,6 +1304,91 @@ async def test_recommendation_generation_receives_full_exclusion_catalogue() -> 
     )
     recalled = awaited_kwargs(llm.parse_message)["knowledge"]
     assert "Фильм 440" in recalled and "Фильм 0" in recalled
+
+
+@pytest.mark.asyncio
+async def test_a_title_no_directory_knows_never_reaches_the_user() -> None:
+    """The bot offered «Список контактов», retelling the plot of «Контакт»."""
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    batch = recommending("Список контактов", "Дюна", "Магнолия", limit=2)
+    process, _, executed = use_case(
+        decisions=[batch, batch],
+        knowledge=knowledge,
+        films=known(
+            FilmRecord(title="Дюна", original_title="Dune", year=2021),
+            FilmRecord(title="Магнолия", original_title="Magnolia", year=1999),
+        ),
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    actions = executed.execute_many.await_args.args[0]
+    assert [candidate.title for candidate in actions[0].candidates] == [
+        "Дюна",
+        "Магнолия",
+    ]
+    assert actions[0].candidates[0].year == 2021
+    assert "Dune" in actions[0].candidates[0].aliases
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_watched_film_is_excluded_under_its_real_title() -> None:
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    batch = recommending("Контакт с внеземным разумом", "Дюна", limit=1)
+    # The directory resolves the loose title back to the watched film.
+    resolved = {
+        "Контакт с внеземным разумом": FilmRecord("Контакт", "Contact", 1997),
+        "Дюна": FilmRecord("Дюна", "Dune", 2021),
+    }
+
+    async def find(*, title: str, year: int | None) -> FilmRecord | None:
+        return resolved.get(title)
+
+    process, _, executed = use_case(
+        decisions=[batch, batch],
+        knowledge=knowledge,
+        films=SimpleNamespace(find=find, close=AsyncMock()),
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    actions = executed.execute_many.await_args.args[0]
+    assert [candidate.title for candidate in actions[0].candidates] == ["Дюна"]
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_directory_never_swallows_the_whole_batch() -> None:
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    batch = recommending("Дюна", "Магнолия", limit=2)
+    films = SimpleNamespace(
+        find=AsyncMock(side_effect=FilmDirectoryError("offline")), close=AsyncMock()
+    )
+    process, _, executed = use_case(
+        decisions=[batch, batch], knowledge=knowledge, films=films
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    actions = executed.execute_many.await_args.args[0]
+    assert [candidate.title for candidate in actions[0].candidates] == [
+        "Дюна",
+        "Магнолия",
+    ]
 
 
 @pytest.mark.asyncio

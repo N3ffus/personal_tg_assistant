@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     http_host: str = "0.0.0.0"  # nosec B104
     http_port: int = Field(default=8080, ge=1, le=65535)
 
+    # An external film directory catches invented titles in recommendations.
+    # Without a key recommendations still work, just unverified.
+    tmdb_api_key: SecretStr = SecretStr("")
+
     # Knowledge memory is optional: the bot keeps working when Neo4j is down.
     knowledge_memory_enabled: bool = False
     neo4j_uri: str = "bolt://neo4j:7687"

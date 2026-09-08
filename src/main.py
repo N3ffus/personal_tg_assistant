@@ -19,6 +19,7 @@ from src.infrastructure.calendar.oauth import GoogleOAuthService, create_oauth_a
 from src.infrastructure.calendar.storage import CalendarStorage
 from src.infrastructure.context.business_storage import BusinessStorage
 from src.infrastructure.context.storage import ContextStorage
+from src.infrastructure.films.tmdb import TMDBFilmDirectory
 from src.infrastructure.knowledge.factory import create_knowledge_service
 from src.infrastructure.llm.gonkagate import (
     GonkaGateLLMClient,
@@ -81,6 +82,11 @@ async def main() -> None:
     bot: Bot | None = None
     business_worker: BusinessDialogWorker | None = None
     knowledge: KnowledgeService | None = None
+    films = (
+        TMDBFilmDirectory(api_key=settings.tmdb_api_key.get_secret_value())
+        if settings.tmdb_api_key.get_secret_value()
+        else None
+    )
     try:
         storage = CalendarStorage(
             database_path=settings.database_path,
@@ -140,6 +146,7 @@ async def main() -> None:
             action_executor=action_executor,
             contexts=contexts,
             knowledge=knowledge,
+            films=films,
         )
 
         dispatcher = Dispatcher()
@@ -202,8 +209,12 @@ async def main() -> None:
                 try:
                     await llm.close()
                 finally:
-                    if bot is not None:
-                        await bot.session.close()
+                    try:
+                        if bot is not None:
+                            await bot.session.close()
+                    finally:
+                        if films is not None:
+                            await films.close()
 
 
 if __name__ == "__main__":

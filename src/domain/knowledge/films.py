@@ -3,7 +3,17 @@
 import re
 import unicodedata
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Protocol
+
+
+@dataclass(frozen=True)
+class FilmRecord:
+    """A film an external directory confirms exists."""
+
+    title: str
+    original_title: str
+    year: int | None
 
 
 def title_key(title: str) -> str:
