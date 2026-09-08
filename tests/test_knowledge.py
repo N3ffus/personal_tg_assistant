@@ -551,7 +551,9 @@ async def test_adapter_embeds_the_episode_it_stores() -> None:
     )
 
     graphiti.embedder.create.assert_awaited_once()
-    written = [query for query in graphiti.queries if "content_embedding" in query["query"]]
+    written = [
+        query for query in graphiti.queries if "content_embedding" in query["query"]
+    ]
     assert len(written) == 1
     assert written[0]["uuid"] == "episode-uuid"
     assert written[0]["embedding"] == [0.1, 0.2, 0.3]
@@ -606,15 +608,25 @@ async def test_adapter_recalls_episodes_by_meaning() -> None:
             source="telegram_message:627",
         )
     ]
-    vector = [query for query in graphiti.queries if "vector.similarity" in query["query"]]
+    vector = [
+        query for query in graphiti.queries if "vector.similarity" in query["query"]
+    ]
     assert vector[0]["namespace"] == "user_abc"
 
 
 @pytest.mark.asyncio
 async def test_adapter_never_repeats_an_episode_found_both_ways() -> None:
     graphiti = FakeGraphiti(
-        found_episodes=[found_episode(content="Пользователь: Один факт", group_id="user_abc")],
-        similar=[{"name": "telegram_message:627", "content": "Пользователь: Один факт", "valid_at": NOW}],
+        found_episodes=[
+            found_episode(content="Пользователь: Один факт", group_id="user_abc")
+        ],
+        similar=[
+            {
+                "name": "telegram_message:627",
+                "content": "Пользователь: Один факт",
+                "valid_at": NOW,
+            }
+        ],
     )
 
     facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
