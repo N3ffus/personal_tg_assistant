@@ -1,6 +1,7 @@
 import logging
-from datetime import UTC
+from datetime import UTC, datetime
 from itertools import zip_longest
+from typing import Any
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -169,7 +170,11 @@ class GraphitiKnowledgeMemory:
                 continue
             seen.add(text)
             facts.append(
-                KnowledgeFact(fact=text, valid_from=row["valid_at"], source=row["name"])
+                KnowledgeFact(
+                    fact=text,
+                    valid_from=_as_datetime(row["valid_at"]),
+                    source=row["name"],
+                )
             )
             if len(facts) == limit:
                 break
@@ -202,6 +207,20 @@ class GraphitiKnowledgeMemory:
             for episode in episodes
             if episode.group_id == namespace
         }
+
+
+def _as_datetime(value: Any) -> datetime | None:
+    """Convert the driver's own temporal type; Graphiti's models do it for us.
+
+    A hand-written Cypher query returns ``neo4j.time.DateTime``, which the
+    strict domain field rejects — that turned every top-up into a degraded
+    search until this conversion existed.
+    """
+    if isinstance(value, datetime):
+        return value
+    to_native = getattr(value, "to_native", None)
+    converted = to_native() if callable(to_native) else None
+    return converted if isinstance(converted, datetime) else None
 
 
 def _without_speaker(content: str) -> str:

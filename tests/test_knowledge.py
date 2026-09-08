@@ -552,6 +552,45 @@ async def test_adapter_tops_up_a_thin_recall_with_the_newest_episodes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_adapter_converts_the_drivers_own_datetime_in_the_top_up() -> None:
+    """A raw driver query returns neo4j.time.DateTime; the domain wants datetime.
+
+    Graphiti's own models convert it, a hand-written query does not, and the
+    strict field turned every top-up into a degraded search in production.
+    """
+    graphiti = FakeGraphiti(
+        latest=[
+            {
+                "name": "telegram_message:627",
+                "content": "родился 02.05.2003",
+                "valid_at": SimpleNamespace(to_native=lambda: NOW),
+            }
+        ]
+    )
+
+    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
+
+    assert facts == [
+        KnowledgeFact(
+            fact="родился 02.05.2003",
+            valid_from=NOW,
+            source="telegram_message:627",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_tolerates_a_top_up_row_without_a_timestamp() -> None:
+    graphiti = FakeGraphiti(
+        latest=[{"name": "note:1", "content": "Факт", "valid_at": None}]
+    )
+
+    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
+
+    assert facts == [KnowledgeFact(fact="Факт", valid_from=None, source="note:1")]
+
+
+@pytest.mark.asyncio
 async def test_adapter_skips_the_top_up_when_the_search_filled_the_limit() -> None:
     graphiti = FakeGraphiti(
         edges=[
