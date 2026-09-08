@@ -35,6 +35,7 @@ from src.domain.assistant.models import (
     DeleteTaskAction,
     ListEventsAction,
     ListTasksAction,
+    RecommendFilmsAction,
     RememberKnowledgeAction,
     SaveNoteAction,
     SearchKnowledgeAction,
@@ -43,6 +44,7 @@ from src.domain.assistant.models import (
 from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
 from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
 from src.domain.calendar.models import CalendarEvent
+from src.domain.knowledge.films import title_key, title_keys
 from src.domain.knowledge.models import KnowledgeFact, KnowledgeSourceType
 from src.domain.tasks.models import Task
 
@@ -149,6 +151,11 @@ class ActionExecutor:
         responses: list[str] = []
         confirmations: list[Confirmation] = []
         pages: list[ResultPage] = []
+        if any(isinstance(action, RecommendFilmsAction) for action in actions):
+            # A model's accompanying chat must not bypass catalogue exclusion.
+            actions = [
+                action for action in actions if not isinstance(action, ChatAction)
+            ]
         for action in actions:
             try:
                 response = await self.execute(
@@ -179,7 +186,12 @@ class ActionExecutor:
             except KnowledgeMemoryError:
                 if not isinstance(
                     action,
-                    (RememberKnowledgeAction, SearchKnowledgeAction, SaveNoteAction),
+                    (
+                        RememberKnowledgeAction,
+                        SearchKnowledgeAction,
+                        SaveNoteAction,
+                        RecommendFilmsAction,
+                    ),
                 ):
                     raise
                 response = MEMORY_UNAVAILABLE
@@ -308,12 +320,52 @@ class ActionExecutor:
             )
             return f"🧠 Запомнил: {action.content}"
 
+        if isinstance(action, RecommendFilmsAction):
+            if self._knowledge is None:
+                return MEMORY_UNAVAILABLE
+            watched = {
+                key
+                for title in await self._knowledge.watched_film_titles(user_id=user_id)
+                for key in title_keys(title)
+            }
+            if not watched:
+                return "Не удалось проверить историю просмотров; не могу исключить уже просмотренные фильмы."
+            selected: list[str] = []
+            excluded = set(watched)
+            for candidate in action.candidates:
+                keys = {
+                    key
+                    for title in [candidate.title, *candidate.aliases]
+                    for key in title_keys(title)
+                }
+                if not title_key(candidate.title) or keys & excluded:
+                    continue
+                excluded.update(keys)
+                reason = candidate.reason.strip()
+                selected.append(
+                    f"«{candidate.title}» — {reason}"
+                    if reason
+                    else f"«{candidate.title}»"
+                )
+                if len(selected) == action.limit:
+                    break
+            if not selected:
+                return "Все предложенные кандидаты уже есть в истории просмотров; подходящих новых вариантов пока не нашёл."
+            return "В твоём списке просмотренных нет:\n" + "\n".join(selected)
+
         if isinstance(action, SearchKnowledgeAction):
             if self._knowledge is None:
                 return "⚠️ Долговременная память отключена, поиск по ней недоступен."
-            facts = await self._knowledge.search(
-                user_id=user_id, query=action.query, limit=action.limit
-            )
+            if action.mode == "watched_film_catalogue":
+                facts = await self._knowledge.watched_film_catalogue(user_id=user_id)
+            elif action.mode == "recent_watched_films":
+                facts = await self._knowledge.recent_watched_films(
+                    user_id=user_id, limit=action.limit
+                )
+            else:
+                facts = await self._knowledge.search(
+                    user_id=user_id, query=action.query, limit=action.limit
+                )
             return self.format_facts(facts)
 
         raise ValueError(f"Unsupported action: {type(action)!r}")

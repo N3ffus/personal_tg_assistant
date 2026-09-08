@@ -15,7 +15,10 @@ class Scenario:
     tools: tuple[str, ...]
     expected: str
     reply_contains: tuple[str, ...] = ()
+    # Fragments that must be absent: an exclusion the judge cannot waive.
+    reply_excludes: tuple[str, ...] = ()
     # Facts the long-term memory returns for any search this scenario triggers.
+    # A film scenario reads them as the watched catalogue as well.
     knowledge_facts: tuple[str, ...] = ()
     now: datetime = NOW
     timezone: str = "Europe/Moscow"
@@ -397,6 +400,57 @@ SCENARIOS = (
         knowledge_facts=(
             "Пользователь называется Васильев Андрей Сергеевич",
             "Пользователь работает с Python",
+        ),
+    ),
+    Scenario(
+        "recommendations_exclude_every_watched_film",
+        "Посоветуй фильмы, которые я не смотрел",
+        (
+            {
+                "type": "recommend_films",
+                "candidates": [{"title": "Пример", "reason": "Пример"}],
+            },
+        ),
+        (),
+        "Ответить действием recommend_films, а не chat со списком фильмов. Ответ "
+        "пользователю не должен называть ни один фильм из каталога просмотренного "
+        "(memory_lookups, knowledge.watched_film_titles): каталог просмотрен весь, "
+        "независимо от даты. Кандидаты внутри действия — это заявка, которую "
+        "приложение само сверяет с каталогом, поэтому суди по тексту ответа.",
+        ("В твоём списке просмотренных нет",),
+        reply_excludes=(
+            "«Интерстеллар»",
+            "«Побег из Шоушенка»",
+            "«Зелёная миля»",
+            "«Форрест Гамп»",
+            "«Криминальное чтиво»",
+            "«Бойцовский клуб»",
+            "«Достучаться до небес»",
+            "«Ла-Ла Ленд»",
+            "«Паразиты»",
+            "«Прибытие»",
+            "«Отступники»",
+            "«Престиж»",
+            "«Остров проклятых»",
+            "«Список Шиндлера»",
+            "«Игры разума»",
+        ),
+        knowledge_facts=(
+            "Интерстеллар",
+            "Побег из Шоушенка",
+            "Зелёная миля",
+            "Форрест Гамп",
+            "Криминальное чтиво",
+            "Бойцовский клуб",
+            "Достучаться до небес",
+            "Ла-Ла Ленд",
+            "Паразиты",
+            "Прибытие",
+            "Отступники",
+            "Престиж",
+            "Остров проклятых",
+            "Список Шиндлера",
+            "Игры разума",
         ),
     ),
 )

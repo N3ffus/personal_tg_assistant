@@ -84,9 +84,27 @@ class SearchKnowledgeAction(DomainModel):
 
     type: Literal[ActionType.SEARCH_KNOWLEDGE]
     query: str = Field(min_length=1, max_length=400)
+    mode: Literal["semantic", "recent_watched_films", "watched_film_catalogue"] = (
+        "semantic"
+    )
     limit: int = Field(
         default=DEFAULT_KNOWLEDGE_RESULTS, ge=1, le=MAX_KNOWLEDGE_RESULTS
     )
+
+
+class FilmCandidate(DomainModel):
+    title: str = Field(min_length=1, max_length=200)
+    aliases: list[str] = Field(default_factory=list, max_length=8)
+    # A blank reason must not invalidate the whole decision: the model dropped
+    # one on a fifteen-candidate list and the user got an error instead of an
+    # answer. The title alone is still a usable recommendation.
+    reason: str = Field(default="", max_length=300)
+
+
+class RecommendFilmsAction(DomainModel):
+    type: Literal[ActionType.RECOMMEND_FILMS]
+    candidates: list[FilmCandidate] = Field(min_length=1, max_length=30)
+    limit: int = Field(default=3, ge=1, le=10)
 
 
 AssistantAction = Annotated[
@@ -102,7 +120,8 @@ AssistantAction = Annotated[
     | DeleteAllEventsAction
     | SaveNoteAction
     | RememberKnowledgeAction
-    | SearchKnowledgeAction,
+    | SearchKnowledgeAction
+    | RecommendFilmsAction,
     Field(discriminator="type"),
 ]
 

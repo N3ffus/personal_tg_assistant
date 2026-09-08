@@ -23,6 +23,8 @@ from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
     AssistantDecision,
     ChatAction,
+    FilmCandidate,
+    RecommendFilmsAction,
     RememberKnowledgeAction,
     SaveNoteAction,
     SearchKnowledgeAction,
@@ -888,6 +890,120 @@ def service(**mocks: object) -> KnowledgeService:
 
 
 @pytest.mark.asyncio
+async def test_recommendations_exclude_entire_catalogue_aliases_and_duplicates() -> (
+    None
+):
+    titles = [f"Старый фильм {i}" for i in range(440)] + [
+        "Достать ножи: Стеклянная луковица",
+        "Начало",
+        "Славные парни (1990)",
+        "Ёлки",
+    ]
+    catalogue = AsyncMock(return_value=titles)
+    knowledge = service(watched_film_titles=catalogue)
+    action = RecommendFilmsAction(
+        type=ActionType.RECOMMEND_FILMS,
+        limit=3,
+        candidates=[
+            FilmCandidate(title="INCEPTION", aliases=["«Начало»"], reason="a"),
+            FilmCandidate(title="Стеклянная луковица", reason="уже просмотрен"),
+            FilmCandidate(title="Славные-парни", reason="b"),
+            FilmCandidate(title="Елки", reason="c"),
+            FilmCandidate(title="Старый фильм 439", reason="d"),
+            FilmCandidate(title="Новый фильм", aliases=["New film"], reason="e"),
+            FilmCandidate(title="New film", reason="f"),
+            FilmCandidate(title="Ещё новый фильм", reason="g"),
+        ],
+    )
+    result = await executor(knowledge=knowledge).execute_many(
+        [ChatAction(type=ActionType.CHAT, text="Советую Начало"), action],
+        user_id=42,
+        now=NOW,
+    )
+    assert isinstance(result, str)
+    assert "Новый фильм" in result and "Ещё новый фильм" in result
+    assert all(
+        title not in result
+        for title in [
+            "Начало",
+            "INCEPTION",
+            "Славные",
+            "Елки",
+            "Старый",
+            "New film",
+            "Стеклянная луковица",
+        ]
+    )
+    catalogue.assert_awaited_once_with(namespace=namespace_for(42))
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_without_a_reason_still_reaches_the_user() -> None:
+    """A dropped reason once invalidated the whole decision and lost the answer."""
+    action = RecommendFilmsAction.model_validate(
+        {
+            "type": ActionType.RECOMMEND_FILMS,
+            "limit": 2,
+            "candidates": [
+                {"title": "Безмолвный фильм", "reason": "  "},
+                {"title": "Второй фильм", "reason": "Причина"},
+            ],
+        }
+    )
+    result = await executor(
+        knowledge=service(watched_film_titles=AsyncMock(return_value=["Начало"]))
+    ).execute_many([action], user_id=42, now=NOW)
+
+    assert isinstance(result, str)
+    assert "«Безмолвный фильм»" in result and "—  " not in result
+    assert "«Второй фильм» — Причина" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_unavailable_catalogue_never_leaks_unchecked_recommendations(
+    failure: bool,
+) -> None:
+    catalogue = AsyncMock(return_value=[])
+    if failure:
+        catalogue.side_effect = KnowledgeMemoryError("offline")
+    action = RecommendFilmsAction(
+        type=ActionType.RECOMMEND_FILMS,
+        candidates=[
+            FilmCandidate(title="Непроверенный фильм", reason="Непроверенная причина")
+        ],
+    )
+    result = await executor(
+        knowledge=service(watched_film_titles=catalogue)
+    ).execute_many([action], user_id=42, now=NOW)
+    assert isinstance(result, str)
+    assert "Непроверенный" not in result
+
+
+@pytest.mark.asyncio
+async def test_catalogue_keeps_old_undated_titles_without_search_limit() -> None:
+    graph = FakeGraphiti()
+    query = AsyncMock(
+        return_value=(
+            [
+                {"content": f"Просмотренный фильм: Фильм {i}; жанр: драма"}
+                for i in range(450)
+            ],
+            None,
+            None,
+        )
+    )
+    graph.driver.execute_query = query
+    titles = await memory(graph).watched_film_titles(namespace=namespace_for(42))
+    assert len(titles) == 450
+    assert titles[-1] == "Фильм 449"
+    args = query.await_args
+    assert args is not None
+    assert args.kwargs["namespace"] == namespace_for(42)
+    assert "LIMIT" not in args.args[0] and "watched_at" not in args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_remember_tool_uses_the_trusted_user_id() -> None:
     backend = AsyncMock()
     knowledge = KnowledgeService(memory=SimpleNamespace(remember=backend))
@@ -1093,6 +1209,115 @@ def searching(query: str = "фильм") -> AssistantDecision:
     return AssistantDecision(
         actions=[SearchKnowledgeAction(type=ActionType.SEARCH_KNOWLEDGE, query=query)]
     )
+
+
+@pytest.mark.asyncio
+async def test_recommendation_generation_receives_full_exclusion_catalogue() -> None:
+    titles = [f"Фильм {i}" for i in range(441)]
+    knowledge = service(watched_film_titles=AsyncMock(return_value=titles))
+    recommendation = AssistantDecision(
+        actions=[
+            RecommendFilmsAction(
+                type=ActionType.RECOMMEND_FILMS,
+                candidates=[FilmCandidate(title="Новый фильм", reason="Причина")],
+            )
+        ]
+    )
+    process, llm, _ = use_case(
+        decisions=[recommendation, recommendation], knowledge=knowledge
+    )
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+    recalled = awaited_kwargs(llm.parse_message)["knowledge"]
+    assert "Фильм 440" in recalled and "Фильм 0" in recalled
+
+
+@pytest.mark.asyncio
+async def test_catalogue_answer_cannot_bypass_filter_in_chat() -> None:
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Начало"]))
+    decision = AssistantDecision(
+        actions=[
+            SearchKnowledgeAction(
+                type=ActionType.SEARCH_KNOWLEDGE,
+                query="фильмы",
+                mode="watched_film_catalogue",
+            )
+        ]
+    )
+    process, _, executed = use_case(
+        decisions=[decision, chat("Советую Начало")], knowledge=knowledge
+    )
+    await process.execute(
+        text="Посоветуй непросмотренное", now=NOW, timezone="Europe/Moscow", user_id=42
+    )
+    actions = executed.execute_many.await_args.args[0]
+    assert actions[0].type == ActionType.CHAT and "Начало" not in actions[0].text
+
+
+@pytest.mark.asyncio
+async def test_recent_films_use_dated_catalogue_and_reach_answer_turn() -> None:
+    recent = AsyncMock(
+        return_value=[KnowledgeFact(fact="Последний фильм", valid_from=NOW)]
+    )
+    semantic = AsyncMock()
+    knowledge = KnowledgeService(
+        memory=SimpleNamespace(recent_watched_films=recent, search=semantic)
+    )
+    decision = AssistantDecision(
+        actions=[
+            SearchKnowledgeAction(
+                type=ActionType.SEARCH_KNOWLEDGE,
+                query="недавние фильмы",
+                mode="recent_watched_films",
+                limit=3,
+            )
+        ]
+    )
+    process, llm, _ = use_case(
+        decisions=[decision, chat("Последний фильм")], knowledge=knowledge
+    )
+    await process.execute(
+        text="Какие фильмы недавно я смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+    recent.assert_awaited_once_with(namespace=namespace_for(42), limit=3)
+    semantic.assert_not_awaited()
+    assert "Последний фильм" in awaited_kwargs(llm.parse_message)["knowledge"]
+    assert NOW.isoformat() in awaited_kwargs(llm.parse_message)["knowledge"]
+
+
+@pytest.mark.asyncio
+async def test_recent_films_convert_neo4j_dates_and_handle_unavailability() -> None:
+    from neo4j.time import DateTime
+
+    graph = FakeGraphiti()
+    query = AsyncMock(
+        return_value=(
+            [
+                {
+                    "content": "Просмотренный фильм: Пример",
+                    "name": "catalogue:1",
+                    "watched_at": DateTime.from_native(NOW),
+                }
+            ],
+            None,
+            None,
+        )
+    )
+    graph.driver.execute_query = query
+    facts = await memory(graph).recent_watched_films(
+        namespace=namespace_for(42), limit=3
+    )
+    assert facts[0].valid_from == NOW
+    query.side_effect = RuntimeError("offline")
+    with pytest.raises(KnowledgeMemoryError):
+        await memory(graph).recent_watched_films(namespace=namespace_for(42), limit=3)
 
 
 @pytest.mark.asyncio

@@ -105,5 +105,29 @@ class KnowledgeService:
             logger.warning("knowledge.healthcheck.failed reason=%s", error)
             return False
 
+    async def recent_watched_films(
+        self, *, user_id: int, limit: int = DEFAULT_KNOWLEDGE_RESULTS
+    ) -> list[KnowledgeFact]:
+        return await self._memory.recent_watched_films(
+            namespace=namespace_for(user_id),
+            limit=max(1, min(limit, MAX_KNOWLEDGE_RESULTS)),
+        )
+
     async def close(self) -> None:
         await self._memory.close()
+
+    async def watched_film_titles(self, *, user_id: int) -> list[str]:
+        return await self._memory.watched_film_titles(namespace=namespace_for(user_id))
+
+    async def watched_film_catalogue(self, *, user_id: int) -> list[KnowledgeFact]:
+        titles = await self.watched_film_titles(user_id=user_id)
+        return (
+            [
+                KnowledgeFact(
+                    fact="Полный каталог просмотренных фильмов для исключения из рекомендаций:\n"
+                    + "\n".join(titles)
+                )
+            ]
+            if titles
+            else []
+        )

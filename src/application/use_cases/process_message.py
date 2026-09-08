@@ -19,6 +19,7 @@ from src.domain.assistant.models import (
     AssistantAction,
     AssistantDecision,
     ChatAction,
+    RecommendFilmsAction,
     SearchKnowledgeAction,
 )
 from src.domain.assistant.replies import AssistantReply, ResultPage
@@ -151,14 +152,24 @@ class ProcessMessageUseCase:
     ) -> AssistantDecision:
         """Answer memory questions with the facts the graph actually holds.
 
-        Retrieval is tool-based: only a decision that asked for a search pays for
-        the second model call.
+        Retrieval is tool-based; recommendations also fetch the full exclusion
+        catalogue before the final candidate generation.
         """
         searches = [
             action
             for action in decision.actions
             if isinstance(action, SearchKnowledgeAction)
         ]
+        if any(
+            isinstance(action, RecommendFilmsAction) for action in decision.actions
+        ) and not any(search.mode == "watched_film_catalogue" for search in searches):
+            searches.append(
+                SearchKnowledgeAction(
+                    type=ActionType.SEARCH_KNOWLEDGE,
+                    query="Просмотренные фильмы для исключения",
+                    mode="watched_film_catalogue",
+                )
+            )
         if not searches or self._knowledge is None:
             return decision
         recalled, facts = await self._recall(searches, user_id=user_id)
@@ -169,6 +180,21 @@ class ProcessMessageUseCase:
             knowledge=recalled,
             **({"context": context} if context else {}),
         )
+        if any(search.mode == "watched_film_catalogue" for search in searches):
+            recommendations: list[AssistantAction] = [
+                action
+                for action in informed.actions
+                if isinstance(action, RecommendFilmsAction)
+            ]
+            return AssistantDecision(
+                actions=recommendations
+                or [
+                    ChatAction(
+                        type=ActionType.CHAT,
+                        text="Не удалось подобрать и проверить новые фильмы; попробуй уточнить жанр.",
+                    )
+                ]
+            )
         actions: list[AssistantAction] = [
             action
             for action in informed.actions
@@ -194,9 +220,18 @@ class ProcessMessageUseCase:
         facts: list[KnowledgeFact] = []
         for search in searches:
             try:
-                found = await self._knowledge.search(
-                    user_id=user_id, query=search.query, limit=search.limit
-                )
+                if search.mode == "watched_film_catalogue":
+                    found = await self._knowledge.watched_film_catalogue(
+                        user_id=user_id
+                    )
+                elif search.mode == "recent_watched_films":
+                    found = await self._knowledge.recent_watched_films(
+                        user_id=user_id, limit=search.limit
+                    )
+                else:
+                    found = await self._knowledge.search(
+                        user_id=user_id, query=search.query, limit=search.limit
+                    )
             except KnowledgeMemoryError as error:
                 logger.warning("knowledge.search.degraded reason=%s", error)
                 return (

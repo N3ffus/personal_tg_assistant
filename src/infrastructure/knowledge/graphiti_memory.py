@@ -218,8 +218,56 @@ class GraphitiKnowledgeMemory:
             return False
         return True
 
+    async def recent_watched_films(
+        self, *, namespace: str, limit: int
+    ) -> list[KnowledgeFact]:
+        # A catalogue query must rank the entire dated collection, not a small
+        # semantic shortlist. Missing watch dates never mean "watched today".
+        try:
+            rows, _, _ = await self._graphiti.driver.execute_query(
+                "MATCH (episode:Episodic {group_id: $namespace}) "
+                "WHERE episode.source_description = 'structured film export' "
+                "AND episode.watched_at IS NOT NULL "
+                "RETURN episode.content AS content, episode.name AS name, "
+                "episode.watched_at AS watched_at "
+                "ORDER BY episode.watched_at DESC, episode.name ASC LIMIT $limit",
+                namespace=namespace,
+                limit=limit,
+                routing_="r",
+            )
+            return [
+                KnowledgeFact(
+                    fact=row["content"],
+                    source=row["name"],
+                    valid_from=_as_datetime(row["watched_at"]),
+                )
+                for row in rows
+            ]
+        except Exception as error:
+            raise KnowledgeMemoryError(_reason(error)) from error
+
     async def close(self) -> None:
         await self._graphiti.close()  # type: ignore[no-untyped-call]
+
+    async def watched_film_titles(self, *, namespace: str) -> list[str]:
+        try:
+            rows, _, _ = await self._graphiti.driver.execute_query(
+                "MATCH (episode:Episodic {group_id: $namespace}) "
+                "WHERE episode.source_description = 'structured film export' "
+                "RETURN episode.content AS content",
+                namespace=namespace,
+                routing_="r",
+            )
+            prefix = "Просмотренный фильм: "
+            return list(
+                dict.fromkeys(
+                    row["content"].removeprefix(prefix).split(";", 1)[0].strip()
+                    for row in rows
+                    if row["content"].startswith(prefix)
+                )
+            )
+        except Exception as error:
+            raise KnowledgeMemoryError(_reason(error)) from error
 
     async def _episode_names(
         self, *, namespace: str, uuids: list[str]

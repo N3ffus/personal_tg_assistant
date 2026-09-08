@@ -225,9 +225,16 @@ class RecordingIntegrations:
 
 @dataclass
 class RecordingKnowledge:
-    """A graph frozen at the facts a scenario declares."""
+    """A graph frozen at the facts a scenario declares.
+
+    A film scenario reads the same facts as the watched catalogue. Lookups are
+    recorded separately from the integration calls: recall happens before the
+    decision exists, so it maps to no action, but the judge must still see that
+    the application really read memory instead of inventing the answer.
+    """
 
     facts: tuple[str, ...]
+    calls: list[RecordedCall] = field(default_factory=list)
 
     async def remember(self, *, namespace: str, episode: KnowledgeEpisode) -> None:
         raise AssertionError("A recall scenario must not write to memory")
@@ -235,13 +242,39 @@ class RecordingKnowledge:
     async def search(
         self, *, namespace: str, query: str, limit: int
     ) -> list[KnowledgeFact]:
-        return [KnowledgeFact(fact=fact) for fact in self.facts][:limit]
+        facts = [KnowledgeFact(fact=fact) for fact in self.facts][:limit]
+        self.calls.append(
+            RecordedCall(
+                "knowledge.search",
+                {"query": query, "limit": limit},
+                [fact.fact for fact in facts],
+            )
+        )
+        return facts
 
     async def healthcheck(self) -> bool:
         return True
 
+    async def recent_watched_films(
+        self, *, namespace: str, limit: int
+    ) -> list[KnowledgeFact]:
+        facts = [KnowledgeFact(fact=fact) for fact in self.facts][:limit]
+        self.calls.append(
+            RecordedCall(
+                "knowledge.recent_watched_films",
+                {"limit": limit},
+                [fact.fact for fact in facts],
+            )
+        )
+        return facts
+
     async def close(self) -> None:
         return None
+
+    async def watched_film_titles(self, *, namespace: str) -> list[str]:
+        titles = list(self.facts)
+        self.calls.append(RecordedCall("knowledge.watched_film_titles", {}, titles))
+        return titles
 
 
 @dataclass
@@ -273,16 +306,14 @@ class EvaluationRun:
     decision: AssistantDecision
     calls: list[RecordedCall]
     reply: str
+    memory: list[RecordedCall] = field(default_factory=list)
 
 
 async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
     integrations = RecordingIntegrations(scenario)
     recording_llm = RecordingLLM(llm)
-    knowledge = (
-        KnowledgeService(memory=RecordingKnowledge(scenario.knowledge_facts))
-        if scenario.knowledge_facts
-        else None
-    )
+    memory = RecordingKnowledge(scenario.knowledge_facts)
+    knowledge = KnowledgeService(memory=memory) if scenario.knowledge_facts else None
     use_case = ProcessMessageUseCase(
         llm=recording_llm,
         action_executor=ActionExecutor(
@@ -313,4 +344,4 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
                 *(p.text for p in reply.pages),
             ]
         )
-    return EvaluationRun(decision, integrations.calls, reply)
+    return EvaluationRun(decision, integrations.calls, reply, memory.calls)

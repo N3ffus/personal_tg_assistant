@@ -15,3 +15,4 @@ class ActionType(StrEnum):
     SAVE_NOTE = "save_note"
     REMEMBER_KNOWLEDGE = "remember_knowledge"
     SEARCH_KNOWLEDGE = "search_knowledge"
+    RECOMMEND_FILMS = "recommend_films"

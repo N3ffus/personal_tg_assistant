@@ -55,11 +55,15 @@ async def test_live_prompt_and_integrations(
             "This is a controlled test with trusted in-memory integrations. Their recorded "
             "outputs, including EVAL identifiers and .example URLs, are authoritative test data. "
             "The decision is a proposed action plan, not proof of execution. Only recorded "
-            "integration calls are executions; selection/confirmation gates may prevent them.",
+            "integration calls are executions; selection/confirmation gates may prevent them. "
+            "memory_lookups are the long-term-memory reads the application performed on its own "
+            "before and while executing the decision; their outputs are what the assistant knew, "
+            "so an answer supported by them is grounded, not invented.",
             json.dumps(
                 {
                     "authenticated_user_id": scenario.user_id,
                     "integration_calls": [asdict(call) for call in run.calls],
+                    "memory_lookups": [asdict(call) for call in run.memory],
                 },
                 ensure_ascii=False,
             ),

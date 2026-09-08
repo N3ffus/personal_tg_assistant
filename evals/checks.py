@@ -64,3 +64,5 @@ def assert_contract(
             raise AssertionError(f"Unexpected integration call: {call.name}")
     for fragment in scenario.reply_contains:
         assert fragment in run.reply
+    for fragment in scenario.reply_excludes:
+        assert fragment not in run.reply, f"Forbidden fragment in reply: {fragment}"
