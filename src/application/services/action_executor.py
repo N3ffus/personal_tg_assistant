@@ -33,6 +33,7 @@ from src.domain.assistant.models import (
     DeleteAllTasksAction,
     DeleteEventAction,
     DeleteTaskAction,
+    FilmCandidate,
     ListEventsAction,
     ListTasksAction,
     RecommendFilmsAction,
@@ -44,13 +45,20 @@ from src.domain.assistant.models import (
 from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
 from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
 from src.domain.calendar.models import CalendarEvent
-from src.domain.knowledge.films import title_key, title_keys
+from src.domain.knowledge.films import select_unwatched, title_keys
 from src.domain.knowledge.models import KnowledgeFact, KnowledgeSourceType
 from src.domain.tasks.models import Task
 
 logger = logging.getLogger(__name__)
 
 MEMORY_UNAVAILABLE = "⚠️ Долговременная память сейчас недоступна, попробуйте позже."
+
+
+def _film_line(candidate: FilmCandidate) -> str:
+    """A year makes a renamed or invented film visible to the reader."""
+    title = f"«{candidate.title}»" + (f" ({candidate.year})" if candidate.year else "")
+    reason = candidate.reason.strip()
+    return f"{title} — {reason}" if reason else title
 
 
 class ActionExecutor:
@@ -330,28 +338,23 @@ class ActionExecutor:
             }
             if not watched:
                 return "Не удалось проверить историю просмотров; не могу исключить уже просмотренные фильмы."
-            selected: list[str] = []
-            excluded = set(watched)
-            for candidate in action.candidates:
-                keys = {
-                    key
-                    for title in [candidate.title, *candidate.aliases]
-                    for key in title_keys(title)
-                }
-                if not title_key(candidate.title) or keys & excluded:
-                    continue
-                excluded.update(keys)
-                reason = candidate.reason.strip()
-                selected.append(
-                    f"«{candidate.title}» — {reason}"
-                    if reason
-                    else f"«{candidate.title}»"
-                )
-                if len(selected) == action.limit:
-                    break
+            selected = select_unwatched(
+                action.candidates, watched=watched, limit=action.limit
+            )
+            logger.info(
+                "films.recommend.filtered proposed=%s shown=%s limit=%s",
+                len(action.candidates),
+                len(selected),
+                action.limit,
+            )
             if not selected:
-                return "Все предложенные кандидаты уже есть в истории просмотров; подходящих новых вариантов пока не нашёл."
-            return "В твоём списке просмотренных нет:\n" + "\n".join(selected)
+                return (
+                    "Из того, что подобралось, ты уже всё смотрел. Скажи жанр, "
+                    "настроение или год — поищу точнее."
+                )
+            return "В твоём списке просмотренных нет:\n" + "\n".join(
+                _film_line(candidate) for candidate in selected
+            )
 
         if isinstance(action, SearchKnowledgeAction):
             if self._knowledge is None:

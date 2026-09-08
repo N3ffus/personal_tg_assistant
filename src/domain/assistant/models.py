@@ -92,9 +92,16 @@ class SearchKnowledgeAction(DomainModel):
     )
 
 
+# A batch has to outnumber what the user asked for: most of it is filtered out
+# against a catalogue of hundreds of watched films.
+MAX_FILM_CANDIDATES = 30
+
+
 class FilmCandidate(DomainModel):
     title: str = Field(min_length=1, max_length=200)
     aliases: list[str] = Field(default_factory=list, max_length=8)
+    # Shown to the user: a renamed or invented film is obvious next to its year.
+    year: int | None = Field(default=None, ge=1888, le=2100)
     # A blank reason must not invalidate the whole decision: the model dropped
     # one on a fifteen-candidate list and the user got an error instead of an
     # answer. The title alone is still a usable recommendation.
@@ -103,7 +110,9 @@ class FilmCandidate(DomainModel):
 
 class RecommendFilmsAction(DomainModel):
     type: Literal[ActionType.RECOMMEND_FILMS]
-    candidates: list[FilmCandidate] = Field(min_length=1, max_length=30)
+    candidates: list[FilmCandidate] = Field(
+        min_length=1, max_length=MAX_FILM_CANDIDATES
+    )
     limit: int = Field(default=3, ge=1, le=10)
 
 

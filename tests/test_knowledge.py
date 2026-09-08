@@ -29,6 +29,7 @@ from src.domain.assistant.models import (
     SaveNoteAction,
     SearchKnowledgeAction,
 )
+from src.domain.knowledge.films import select_unwatched, title_keys
 from src.domain.knowledge.models import (
     KnowledgeEpisode,
     KnowledgeFact,
@@ -937,6 +938,38 @@ async def test_recommendations_exclude_entire_catalogue_aliases_and_duplicates()
     catalogue.assert_awaited_once_with(namespace=namespace_for(42))
 
 
+def test_select_unwatched_drops_watched_aliases_blanks_and_repeats() -> None:
+    watched = {key for title in ["Контакт", "Ёлки"] for key in title_keys(title)}
+    candidates = [
+        FilmCandidate(title="Контакт", reason="просмотрен"),
+        FilmCandidate(title="Прибытие", aliases=["Елки"], reason="алиас просмотрен"),
+        FilmCandidate(title="  ", reason="пустое название"),
+        FilmCandidate(title="Дюна", aliases=["Dune"], reason="новый"),
+        FilmCandidate(title="Дюна (2021)", reason="тот же фильм"),
+        FilmCandidate(title="Магнолия", reason="новый"),
+        FilmCandidate(title="Пианист", reason="сверх лимита"),
+    ]
+
+    selected = select_unwatched(candidates, watched=watched, limit=2)
+
+    assert [candidate.title for candidate in selected] == ["Дюна", "Магнолия"]
+
+
+@pytest.mark.asyncio
+async def test_recommendations_show_the_release_year_when_the_model_gives_one() -> None:
+    action = RecommendFilmsAction(
+        type=ActionType.RECOMMEND_FILMS,
+        candidates=[FilmCandidate(title="Дюна", year=2021, reason="Эпос")],
+    )
+
+    result = await executor(
+        knowledge=service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    ).execute_many([action], user_id=42, now=NOW)
+
+    assert isinstance(result, str)
+    assert "«Дюна» (2021) — Эпос" in result
+
+
 @pytest.mark.asyncio
 async def test_a_candidate_without_a_reason_still_reaches_the_user() -> None:
     """A dropped reason once invalidated the whole decision and lost the answer."""
@@ -1205,6 +1238,20 @@ def chat(text: str) -> AssistantDecision:
     return AssistantDecision(actions=[ChatAction(type=ActionType.CHAT, text=text)])
 
 
+def recommending(*titles: str, limit: int = 3) -> AssistantDecision:
+    return AssistantDecision(
+        actions=[
+            RecommendFilmsAction(
+                type=ActionType.RECOMMEND_FILMS,
+                limit=limit,
+                candidates=[
+                    FilmCandidate(title=title, reason="Причина") for title in titles
+                ],
+            )
+        ]
+    )
+
+
 def searching(query: str = "фильм") -> AssistantDecision:
     return AssistantDecision(
         actions=[SearchKnowledgeAction(type=ActionType.SEARCH_KNOWLEDGE, query=query)]
@@ -1219,6 +1266,7 @@ async def test_recommendation_generation_receives_full_exclusion_catalogue() -> 
         actions=[
             RecommendFilmsAction(
                 type=ActionType.RECOMMEND_FILMS,
+                limit=1,
                 candidates=[FilmCandidate(title="Новый фильм", reason="Причина")],
             )
         ]
@@ -1234,6 +1282,56 @@ async def test_recommendation_generation_receives_full_exclusion_catalogue() -> 
     )
     recalled = awaited_kwargs(llm.parse_message)["knowledge"]
     assert "Фильм 440" in recalled and "Фильм 0" in recalled
+
+
+@pytest.mark.asyncio
+async def test_a_watched_batch_is_regenerated_once_with_the_rejects_named() -> None:
+    """A model that proposes only watched films must not end in a dead end."""
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт", "Дюна"]))
+    watched_batch = recommending("Контакт", "Дюна", limit=2)
+    fresh_batch = recommending("Магнолия", "Пианист", limit=2)
+    process, llm, executed = use_case(
+        decisions=[watched_batch, watched_batch, fresh_batch], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 3
+    retry_knowledge = llm.parse_message.await_args.kwargs["knowledge"]
+    assert "Контакт" in retry_knowledge and "Дюна" in retry_knowledge
+    actions = executed.execute_many.await_args.args[0]
+    assert [candidate.title for candidate in actions[0].candidates] == [
+        "Магнолия",
+        "Пианист",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_full_batch_of_new_films_is_never_regenerated() -> None:
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    fresh_batch = recommending("Магнолия", "Пианист", limit=2)
+    process, llm, executed = use_case(
+        decisions=[fresh_batch, fresh_batch], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 2
+    actions = executed.execute_many.await_args.args[0]
+    assert [candidate.title for candidate in actions[0].candidates] == [
+        "Магнолия",
+        "Пианист",
+    ]
 
 
 @pytest.mark.asyncio

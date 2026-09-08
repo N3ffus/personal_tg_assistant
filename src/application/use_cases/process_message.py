@@ -16,6 +16,7 @@ from src.application.services.knowledge import KnowledgeService
 from src.domain.assistant.context import ContextMessage
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
+    MAX_FILM_CANDIDATES,
     AssistantAction,
     AssistantDecision,
     ChatAction,
@@ -23,6 +24,7 @@ from src.domain.assistant.models import (
     SearchKnowledgeAction,
 )
 from src.domain.assistant.replies import AssistantReply, ResultPage
+from src.domain.knowledge.films import select_unwatched, title_keys
 from src.domain.knowledge.models import KnowledgeFact
 
 logger = logging.getLogger(__name__)
@@ -181,17 +183,30 @@ class ProcessMessageUseCase:
             **({"context": context} if context else {}),
         )
         if any(search.mode == "watched_film_catalogue" for search in searches):
-            recommendations: list[AssistantAction] = [
+            recommendations = [
                 action
                 for action in informed.actions
                 if isinstance(action, RecommendFilmsAction)
             ]
+            if not recommendations:
+                return AssistantDecision(
+                    actions=[
+                        ChatAction(
+                            type=ActionType.CHAT,
+                            text="Не удалось подобрать и проверить новые фильмы; попробуй уточнить жанр.",
+                        )
+                    ]
+                )
             return AssistantDecision(
-                actions=recommendations
-                or [
-                    ChatAction(
-                        type=ActionType.CHAT,
-                        text="Не удалось подобрать и проверить новые фильмы; попробуй уточнить жанр.",
+                actions=[
+                    await self._topped_up(
+                        recommendations[0],
+                        text=text,
+                        now=now,
+                        timezone=timezone,
+                        user_id=user_id,
+                        context=context,
+                        facts=facts,
                     )
                 ]
             )
@@ -211,6 +226,75 @@ class ProcessMessageUseCase:
                 ]
             )
         return AssistantDecision(actions=actions)
+
+    async def _topped_up(
+        self,
+        action: RecommendFilmsAction,
+        *,
+        text: str,
+        now: datetime,
+        timezone: str,
+        user_id: int,
+        context: str,
+        facts: list[KnowledgeFact],
+    ) -> RecommendFilmsAction:
+        """Ask once more when the catalogue swallowed most of the batch.
+
+        The model tends to propose exactly as many candidates as the user asked
+        for, and against a catalogue of hundreds of films most of them are
+        already watched — leaving the user with a dead end. The rejected titles
+        go back with the request so the second batch is genuinely different.
+        """
+        if self._knowledge is None:  # pragma: no cover - guarded by the caller
+            return action
+        try:
+            watched = {
+                key
+                for title in await self._knowledge.watched_film_titles(user_id=user_id)
+                for key in title_keys(title)
+            }
+        except KnowledgeMemoryError as error:
+            logger.warning("films.topup.skipped reason=%s", error)
+            return action
+        survivors = select_unwatched(
+            action.candidates, watched=watched, limit=action.limit
+        )
+        logger.info(
+            "films.recommend.proposed candidates=%s unwatched=%s limit=%s",
+            len(action.candidates),
+            len(survivors),
+            action.limit,
+        )
+        if not watched or len(survivors) >= action.limit:
+            return action
+        kept = {id(candidate) for candidate in survivors}
+        rejected = [
+            candidate.title
+            for candidate in action.candidates
+            if id(candidate) not in kept
+        ]
+        retry = KnowledgeFact(
+            fact="Эти кандидаты уже просмотрены и отклонены, предложи другие фильмы: "
+            + ", ".join(rejected)
+        )
+        second = await self._llm.parse_message(
+            text=text,
+            now=now,
+            timezone=timezone,
+            knowledge=json.dumps(
+                [fact.as_payload() for fact in [*facts, retry]], ensure_ascii=False
+            ),
+            **({"context": context} if context else {}),
+        )
+        extra = [
+            candidate
+            for other in second.actions
+            if isinstance(other, RecommendFilmsAction)
+            for candidate in other.candidates
+        ]
+        return action.model_copy(
+            update={"candidates": [*survivors, *extra][:MAX_FILM_CANDIDATES]}
+        )
 
     async def _recall(
         self, searches: list[SearchKnowledgeAction], *, user_id: int
