@@ -184,6 +184,47 @@ async def test_openai_client_close_closes_sdk_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_field_hoisted_out_of_an_action_does_not_lose_the_reply() -> None:
+    """The model put a recommendation's `limit` beside actions, not inside."""
+    client = GonkaGateLLMClient(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        model="test-model",
+    )
+    client._client.chat.completions.create = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "actions": [
+                                    {
+                                        "type": "recommend_films",
+                                        "candidates": [
+                                            {"title": "Дюна", "reason": "Эпос"}
+                                        ],
+                                    }
+                                ],
+                                "limit": 3,
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+    )
+
+    decision = await client.parse_message(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+    )
+
+    assert decision.actions[0].type is ActionType.RECOMMEND_FILMS
+
+
+@pytest.mark.asyncio
 async def test_gonkagate_client_includes_json_contract_and_user_context() -> None:
     client = GonkaGateLLMClient(
         api_key="test-key",

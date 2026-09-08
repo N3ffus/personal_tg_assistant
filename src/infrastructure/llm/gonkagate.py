@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,8 @@ from src.infrastructure.llm.openai import (
     answer_turn_suffix,
     message_with_context,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GonkaGateLLMClient:
@@ -104,6 +107,13 @@ class GonkaGateLLMClient:
     @staticmethod
     def _normalize_legacy_decision(decision_data: Any) -> Any:
         if not isinstance(decision_data, dict) or "actions" in decision_data:
+            if isinstance(decision_data, dict) and len(decision_data) > 1:
+                # A field the model hoisted out of an action (it put a
+                # recommendation's `limit` here) must not fail the whole reply:
+                # the decision is its actions, and the strays carry no meaning.
+                strays = [key for key in decision_data if key != "actions"]
+                logger.warning("llm.decision.extra_fields keys=%s", strays)
+                return {"actions": decision_data["actions"]}
             return decision_data
 
         action = decision_data.get("action")
