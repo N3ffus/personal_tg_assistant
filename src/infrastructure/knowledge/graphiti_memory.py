@@ -1,7 +1,6 @@
 import logging
-from datetime import UTC, datetime
+from datetime import UTC
 from itertools import zip_longest
-from typing import Any
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -134,51 +133,7 @@ class GraphitiKnowledgeMemory:
                     fact=text, valid_from=episode.valid_at, source=episode.name
                 )
             )
-        facts = _interleaved(edge_facts, node_facts, episode_facts)[:limit]
-        if len(facts) < limit:
-            facts += await self._recent_episodes(
-                namespace=namespace, limit=limit - len(facts), seen=seen
-            )
-        return facts
-
-    async def _recent_episodes(
-        self, *, namespace: str, limit: int, seen: set[str]
-    ) -> list[KnowledgeFact]:
-        """Fill the leftover slots with what the user most recently said.
-
-        Episode search is BM25 only, so "дата рождения" never matches "родился"
-        and a fact extraction dropped stays hidden behind its own wording. A
-        recall that did not fill its limit has room for the raw material; a
-        recall that did never reaches this query.
-        """
-        try:
-            rows, _, _ = await self._graphiti.driver.execute_query(
-                "MATCH (episode:Episodic {group_id: $namespace}) "
-                "RETURN episode.name AS name, episode.content AS content, "
-                "episode.valid_at AS valid_at "
-                "ORDER BY episode.valid_at DESC LIMIT $limit",
-                namespace=namespace,
-                limit=limit + len(seen),
-                routing_="r",
-            )
-        except Exception as error:
-            raise KnowledgeMemoryError(_reason(error)) from error
-        facts: list[KnowledgeFact] = []
-        for row in rows:
-            text = _without_speaker(row["content"])
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            facts.append(
-                KnowledgeFact(
-                    fact=text,
-                    valid_from=_as_datetime(row["valid_at"]),
-                    source=row["name"],
-                )
-            )
-            if len(facts) == limit:
-                break
-        return facts
+        return _interleaved(edge_facts, node_facts, episode_facts)[:limit]
 
     async def healthcheck(self) -> bool:
         try:
@@ -207,20 +162,6 @@ class GraphitiKnowledgeMemory:
             for episode in episodes
             if episode.group_id == namespace
         }
-
-
-def _as_datetime(value: Any) -> datetime | None:
-    """Convert the driver's own temporal type; Graphiti's models do it for us.
-
-    A hand-written Cypher query returns ``neo4j.time.DateTime``, which the
-    strict domain field rejects — that turned every top-up into a degraded
-    search until this conversion existed.
-    """
-    if isinstance(value, datetime):
-        return value
-    to_native = getattr(value, "to_native", None)
-    converted = to_native() if callable(to_native) else None
-    return converted if isinstance(converted, datetime) else None
 
 
 def _without_speaker(content: str) -> str:

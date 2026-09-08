@@ -109,7 +109,6 @@ class FakeGraphiti:
         edges: list[SimpleNamespace] | None = None,
         nodes: list[SimpleNamespace] | None = None,
         found_episodes: list[SimpleNamespace] | None = None,
-        latest: list[dict[str, Any]] | None = None,
         error: Exception | None = None,
     ) -> None:
         self.edges = edges or []
@@ -120,10 +119,7 @@ class FakeGraphiti:
         self.searches: list[dict[str, Any]] = []
         self.closed = False
         self.indices_built = False
-        self.latest = latest or []
-        self.driver = SimpleNamespace(
-            execute_query=AsyncMock(return_value=(self.latest, None, None))
-        )
+        self.driver = SimpleNamespace(execute_query=AsyncMock(return_value=None))
 
     async def build_indices_and_constraints(self) -> None:
         if self.error:
@@ -513,112 +509,14 @@ async def test_adapter_drops_an_episode_that_only_repeats_a_fact(
 ) -> None:
     graphiti = FakeGraphiti(
         edges=[edge(fact="Работает с Python", group_id="user_abc", episodes=[])],
-        found_episodes=[found_episode(content="Работает с Python", group_id="user_abc")],
+        found_episodes=[
+            found_episode(content="Работает с Python", group_id="user_abc")
+        ],
     )
 
     facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
 
     assert [fact.fact for fact in facts] == ["Работает с Python"]
-
-
-@pytest.mark.asyncio
-async def test_adapter_tops_up_a_thin_recall_with_the_newest_episodes() -> None:
-    """Episode search is BM25: «дата рождения» never matches «родился».
-
-    The stored sentence is the only copy of a fact extraction dropped, so a
-    recall with room left over falls back to what the user recently said.
-    """
-    graphiti = FakeGraphiti(
-        edges=[edge(fact="Работает с Python", group_id="user_abc", episodes=[])],
-        latest=[
-            {
-                "name": "telegram_message:627",
-                "content": "Пользователь: родился 02.05.2003",
-                "valid_at": NOW,
-            }
-        ],
-    )
-
-    facts = await memory(graphiti).search(
-        namespace="user_abc", query="дата рождения", limit=5
-    )
-
-    assert [fact.fact for fact in facts] == [
-        "Работает с Python",
-        "родился 02.05.2003",
-    ]
-    assert graphiti.driver.execute_query.await_args is not None
-    assert graphiti.driver.execute_query.await_args.kwargs["namespace"] == "user_abc"
-
-
-@pytest.mark.asyncio
-async def test_adapter_converts_the_drivers_own_datetime_in_the_top_up() -> None:
-    """A raw driver query returns neo4j.time.DateTime; the domain wants datetime.
-
-    Graphiti's own models convert it, a hand-written query does not, and the
-    strict field turned every top-up into a degraded search in production.
-    """
-    graphiti = FakeGraphiti(
-        latest=[
-            {
-                "name": "telegram_message:627",
-                "content": "родился 02.05.2003",
-                "valid_at": SimpleNamespace(to_native=lambda: NOW),
-            }
-        ]
-    )
-
-    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
-
-    assert facts == [
-        KnowledgeFact(
-            fact="родился 02.05.2003",
-            valid_from=NOW,
-            source="telegram_message:627",
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_adapter_tolerates_a_top_up_row_without_a_timestamp() -> None:
-    graphiti = FakeGraphiti(
-        latest=[{"name": "note:1", "content": "Факт", "valid_at": None}]
-    )
-
-    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
-
-    assert facts == [KnowledgeFact(fact="Факт", valid_from=None, source="note:1")]
-
-
-@pytest.mark.asyncio
-async def test_adapter_skips_the_top_up_when_the_search_filled_the_limit() -> None:
-    graphiti = FakeGraphiti(
-        edges=[
-            edge(fact=f"Факт {index}", group_id="user_abc", episodes=[])
-            for index in range(3)
-        ],
-        latest=[{"name": "n", "content": "Лишнее", "valid_at": NOW}],
-    )
-
-    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=3)
-
-    assert [fact.fact for fact in facts] == ["Факт 0", "Факт 1", "Факт 2"]
-    graphiti.driver.execute_query.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_adapter_never_repeats_a_fact_in_the_top_up() -> None:
-    graphiti = FakeGraphiti(
-        found_episodes=[found_episode(content="Своё", group_id="user_abc")],
-        latest=[
-            {"name": "telegram_message:627", "content": "Своё", "valid_at": NOW},
-            {"name": "telegram_message:628", "content": "Другое", "valid_at": NOW},
-        ],
-    )
-
-    facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
-
-    assert [fact.fact for fact in facts] == ["Своё", "Другое"]
 
 
 @pytest.mark.asyncio
