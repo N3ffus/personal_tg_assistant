@@ -30,6 +30,50 @@ def title_keys(title: str) -> set[str]:
     return keys - {""}
 
 
+MAX_RECOMMENDATIONS = 10
+
+# Whole word forms: a stem like «сем» would read «семейный фильм» as seven.
+_COUNT_WORDS = {
+    **dict.fromkeys(["один", "одну", "одного"], 1),
+    **dict.fromkeys(["пару", "парочку", "два", "две", "двух"], 2),
+    **dict.fromkeys(["три", "трех"], 3),
+    **dict.fromkeys(["четыре", "четырех"], 4),
+    **dict.fromkeys(["пять", "пяти"], 5),
+    **dict.fromkeys(["шесть", "шести"], 6),
+    **dict.fromkeys(["семь", "семи"], 7),
+    **dict.fromkeys(["восемь", "восьми"], 8),
+    **dict.fromkeys(["девять", "девяти"], 9),
+    **dict.fromkeys(["десять", "десяти", "десяток"], 10),
+    **dict.fromkeys(["дюжину"], 12),
+}
+_COUNT = r"(\d{1,2}|" + "|".join(_COUNT_WORDS) + r")(?![\w-])"
+# «топ 10», «топ-5» or a count before the noun with up to two words between
+# them: «7 лучших фильмов», «десять хороших фильмов на вечер».
+_REQUESTED_COUNT = re.compile(
+    r"\b(?:топ|top)[\s-]*"
+    + _COUNT
+    + r"|(?<![\w-])"
+    + _COUNT
+    + r"\s+(?:[а-я]+\s+){0,2}(?:фильм|кино|картин)",
+    re.IGNORECASE,
+)
+
+
+def requested_count(text: str) -> int | None:
+    """The number of films the user explicitly asked for, if any.
+
+    The model dropped «топ 10» and kept its default of three (production,
+    2026-09-15), so the application reads the count itself. Anything above
+    `MAX_RECOMMENDATIONS` is capped rather than refused.
+    """
+    match = _REQUESTED_COUNT.search(text.replace("ё", "е").replace("Ё", "Е"))
+    if match is None:
+        return None
+    token = (match.group(1) or match.group(2)).casefold()
+    count = int(token) if token.isdigit() else _COUNT_WORDS[token]
+    return min(count, MAX_RECOMMENDATIONS) if count > 0 else None
+
+
 class Candidate(Protocol):
     """The part of a recommendation candidate that identifies a film."""
 

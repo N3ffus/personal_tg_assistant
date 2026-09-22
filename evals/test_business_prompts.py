@@ -10,7 +10,7 @@ from evals.settings import load_eval_settings
 from src.application.use_cases.process_business_dialog import supported_intents
 from src.domain.assistant.business import BusinessTask
 from src.domain.assistant.context import ContextMessage
-from src.infrastructure.llm.gonkagate import GonkaGateLLMClient
+from src.infrastructure.llm.client import ChatLLMClient
 
 NOW = datetime(2026, 9, 6, 14, 47, tzinfo=UTC)
 OWNER = 42
@@ -183,7 +183,7 @@ SCENARIOS = (
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda scenario: scenario.id)
 async def test_live_business_task_ownership(scenario: BusinessScenario) -> None:
     settings = load_eval_settings()
-    llm = GonkaGateLLMClient(
+    llm = ChatLLMClient(
         api_key=settings.llm_api_key.get_secret_value(),
         base_url=settings.llm_base_url,
         model=settings.llm_model,

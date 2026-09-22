@@ -6,6 +6,11 @@ from cryptography.fernet import Fernet
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+# Chosen over GLM-5.3-Flash on the memory evals, where GLM corrupted its own
+# output often enough to lose replies.
+DEFAULT_LLM_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -18,8 +23,8 @@ class Settings(BaseSettings):
     telegram_allowed_user_id: int = Field(gt=0)
 
     llm_api_key: SecretStr
-    llm_base_url: str = "https://api.gonkagate.com/v1"
-    llm_model: str = "gpt-5.6"
+    llm_base_url: str = DEEPINFRA_BASE_URL
+    llm_model: str = DEFAULT_LLM_MODEL
 
     app_timezone: str = "Europe/Moscow"
 
@@ -51,10 +56,12 @@ class Settings(BaseSettings):
     graphiti_llm_structured_output: Literal["json_schema", "json_object"] = (
         "json_schema"
     )
-    graphiti_embedding_model: str = "text-embedding-3-small"
+    # The default provider is DeepInfra, which serves bge-m3, not OpenAI models:
+    # the old text-embedding-3-small default silently degraded recall to BM25.
+    graphiti_embedding_model: str = "BAAI/bge-m3"
     graphiti_embedding_api_key: SecretStr = SecretStr("")
     graphiti_embedding_base_url: str = ""
-    graphiti_embedding_dim: int = Field(default=1536, ge=1, le=8192)
+    graphiti_embedding_dim: int = Field(default=1024, ge=1, le=8192)
     # Graphiti fans out to 20 concurrent LLM calls by default, which is far
     # more memory than a small host can spare while the bot keeps polling.
     graphiti_max_coroutines: int = Field(default=4, ge=1, le=50)

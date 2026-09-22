@@ -1,37 +1,87 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
+from time import perf_counter
 
 from src.application.ports.films import FilmDirectory
 from src.application.ports.knowledge import KnowledgeMemoryError
 from src.application.ports.llm import LLMClient
 from src.application.services.action_executor import (
+    MEMORY_UNAVAILABLE,
     ActionExecutor,
+    format_facts,
 )
 from src.application.services.context import ContextService
 from src.application.services.explicit_commands import (
     parse_bulk_deletion,
     parse_view_request,
 )
+from src.application.services.film_recommendations import FilmRecommender
 from src.application.services.knowledge import KnowledgeService
+from src.application.services.turn import Turn
 from src.domain.assistant.context import ContextMessage
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
-    MAX_FILM_ALIASES,
-    MAX_FILM_CANDIDATES,
+    MAX_FORGOTTEN_FACTS,
     AssistantAction,
     AssistantDecision,
     ChatAction,
-    FilmCandidate,
+    ForgetKnowledgeAction,
     RecommendFilmsAction,
     SearchKnowledgeAction,
 )
 from src.domain.assistant.replies import AssistantReply, ResultPage
-from src.domain.knowledge.films import FilmRecord, select_unwatched, title_keys
 from src.domain.knowledge.models import KnowledgeFact
 
 logger = logging.getLogger(__name__)
+MAX_PARALLEL_MEMORY_SEARCHES = 4
+NOTHING_TO_FORGET = "В памяти этого нет — забывать нечего."
+
+
+# A long list is where the model breaks its own rules: it writes «Рамен с
+# грибами шиитаке (без грибов)» or offers a place the user has already been to
+# and excuses it in brackets. Prompt wording did not stop it, so a list this
+# long earns one review turn against the recalled facts.
+MIN_REVIEWED_ITEMS = 5
+LIST_ITEM = re.compile(r"^\s*\d{1,2}[.)]\s+\S", re.MULTILINE)
+REVIEW_INSTRUCTION = (
+    "(Это твой черновик ответа. Проверь каждый пункт против ограничений запроса и "
+    "recalled_knowledge: пункт с нарушением («с грибами», место, где пользователь "
+    "уже был, запрещённый тип) замени другим, а не оговаривай в скобках. Число "
+    "пунктов сохрани. Верни chat с готовым ответом.)"
+)
+
+
+SEARCH_ALREADY_DONE = (
+    "(Память уже прочитана целиком, всё найденное — в recalled_knowledge. "
+    "Ответь на сообщение выше действием chat, без search_knowledge.)"
+)
+
+
+def _chat(text: str) -> AssistantDecision:
+    return AssistantDecision(actions=[ChatAction(type=ActionType.CHAT, text=text)])
+
+
+def _without_searches(decision: AssistantDecision) -> list[AssistantAction]:
+    # A second search would loop: answer from what memory already returned.
+    return [
+        action
+        for action in decision.actions
+        if not isinstance(action, SearchKnowledgeAction)
+    ]
+
+
+# A chat reply confessing it does not know something. The prompt forbids saying
+# so about the user without searching, yet the model still answered «Я пока не
+# знаю, куда мы ездили на выходных» with the trip stored (eval, 2026-09-14).
+ADMITS_IGNORANCE = re.compile(
+    r"не\s+(знаю|помню|нашл|говорил|рассказывал|упоминал|сохран)"
+    r"|нет\s+(информации|данных|сведений)"
+    r"|(расскажи|напомни)(те)?\b",
+    re.IGNORECASE,
+)
 
 
 class ProcessMessageUseCase:
@@ -48,7 +98,11 @@ class ProcessMessageUseCase:
         self._action_executor = action_executor
         self._contexts = contexts
         self._knowledge = knowledge
-        self._films = films
+        self._films = (
+            FilmRecommender(llm=llm, knowledge=knowledge, films=films)
+            if knowledge is not None
+            else None
+        )
 
     async def execute(
         self,
@@ -122,55 +176,101 @@ class ProcessMessageUseCase:
         message_id: int | None = None,
         context: str = "",
     ) -> str | AssistantReply:
-        decision = (
-            parse_view_request(text)
-            or parse_bulk_deletion(text)
-            or await self._llm.parse_message(
-                text=text,
-                now=now,
-                timezone=timezone,
-                **({"context": context} if context else {}),
+        turn = Turn(
+            text=text, now=now, timezone=timezone, user_id=user_id, context=context
+        )
+        started = perf_counter()
+        outcome = "failed"
+        try:
+            decision = (
+                parse_view_request(text)
+                or parse_bulk_deletion(text)
+                or await turn.ask(self._llm)
             )
-        )
-        decision = await self._with_recalled_knowledge(
-            decision,
-            text=text,
-            now=now,
-            timezone=timezone,
-            user_id=user_id,
-            context=context,
-        )
+            decision = self._searched_before_admitting_ignorance(decision, text=text)
+            decision = await self._with_recalled_knowledge(decision, turn=turn)
+            reply = await self._action_executor.execute_many(
+                decision.actions, user_id=user_id, now=now, message_id=message_id
+            )
+            outcome = "ok"
+            return reply
+        finally:
+            logger.info(
+                "turn.completed outcome=%s latency_ms=%.0f llm_calls=%d llm_ms=%.0f",
+                outcome,
+                (perf_counter() - started) * 1000,
+                len(turn.llm_seconds),
+                sum(turn.llm_seconds) * 1000,
+            )
 
-        return await self._action_executor.execute_many(
-            decision.actions,
-            user_id=user_id,
-            now=now,
-            message_id=message_id,
+    def _searched_before_admitting_ignorance(
+        self, decision: AssistantDecision, *, text: str
+    ) -> AssistantDecision:
+        """Never let «не знаю» stand when memory was not even consulted.
+
+        Only a reply made of chat alone qualifies: any other action means the
+        model did act on the message. The search uses the user's own words,
+        and the answer turn that follows may still say the fact is unknown.
+        """
+        if self._knowledge is None or not all(
+            isinstance(action, ChatAction) for action in decision.actions
+        ):
+            return decision
+        if not any(
+            ADMITS_IGNORANCE.search(action.text)
+            for action in decision.actions
+            if isinstance(action, ChatAction)
+        ):
+            return decision
+        logger.info("knowledge.recall.forced reason=chat_admitted_ignorance")
+        return AssistantDecision(
+            actions=[
+                SearchKnowledgeAction(
+                    type=ActionType.SEARCH_KNOWLEDGE, query=text.strip()[:400] or "?"
+                )
+            ]
         )
 
     async def _with_recalled_knowledge(
-        self,
-        decision: AssistantDecision,
-        *,
-        text: str,
-        now: datetime,
-        timezone: str,
-        user_id: int,
-        context: str,
+        self, decision: AssistantDecision, *, turn: Turn
     ) -> AssistantDecision:
         """Answer memory questions with the facts the graph actually holds.
 
         Retrieval is tool-based; recommendations also fetch the full exclusion
         catalogue before the final candidate generation.
         """
+        if self._knowledge is None:
+            return decision
+        forgets = [
+            action
+            for action in decision.actions
+            if isinstance(action, ForgetKnowledgeAction)
+        ]
+        if forgets:
+            resolved = await self._forgetting(forgets, turn=turn)
+            # «Уволился из Яндекса, теперь в Ozon» arrived as forget + remember;
+            # resolving the forget must never cost the user the new fact.
+            others: list[AssistantAction] = [
+                action
+                for action in decision.actions
+                if not isinstance(
+                    action, (ForgetKnowledgeAction, SearchKnowledgeAction)
+                )
+            ]
+            if isinstance(resolved, ChatAction) and others:
+                return AssistantDecision(actions=others)
+            return AssistantDecision(actions=[resolved, *others])
         searches = [
             action
             for action in decision.actions
             if isinstance(action, SearchKnowledgeAction)
         ]
-        if any(
+        recommends = any(
             isinstance(action, RecommendFilmsAction) for action in decision.actions
-        ) and not any(search.mode == "watched_film_catalogue" for search in searches):
+        )
+        if recommends and not any(
+            search.mode == "watched_film_catalogue" for search in searches
+        ):
             searches.append(
                 SearchKnowledgeAction(
                     type=ActionType.SEARCH_KNOWLEDGE,
@@ -178,195 +278,158 @@ class ProcessMessageUseCase:
                     mode="watched_film_catalogue",
                 )
             )
-        if not searches or self._knowledge is None:
+        if not searches:
             return decision
-        recalled, facts = await self._recall(searches, user_id=user_id)
-        informed = await self._llm.parse_message(
-            text=text,
-            now=now,
-            timezone=timezone,
-            knowledge=recalled,
-            **({"context": context} if context else {}),
-        )
+        recalled, facts = await self._recall(searches, user_id=turn.user_id)
+        informed = await turn.ask(self._llm, knowledge=recalled)
         if any(search.mode == "watched_film_catalogue" for search in searches):
-            recommendations = [
+            return await self._recommendation(informed, turn=turn, facts=facts)
+        actions = _without_searches(informed)
+        if not actions:
+            # The answer turn searched again instead of answering: «Посоветуй
+            # пиццу» got the raw fact list below on production (2026-09-14),
+            # one answer turn in five. A second ask almost always answers.
+            # Asking identically was not enough once the whole profile came
+            # back: «15 идей» searched again twice and dumped 50 raw facts
+            # (memory eval, 2026-09-16). The retry says the search is done.
+            logger.warning("llm.answer.repeated_search retry=1")
+            actions = _without_searches(
+                await turn.ask(
+                    self._llm,
+                    knowledge=recalled,
+                    text=f"{turn.text}\n\n{SEARCH_ALREADY_DONE}",
+                )
+            )
+        actions = await self._reviewed(actions, turn=turn, recalled=recalled)
+        if not actions:
+            return _chat(format_facts(facts))
+        return AssistantDecision(actions=actions)
+
+    async def _recommendation(
+        self, informed: AssistantDecision, *, turn: Turn, facts: list[KnowledgeFact]
+    ) -> AssistantDecision:
+        recommendation = next(
+            (
                 action
                 for action in informed.actions
                 if isinstance(action, RecommendFilmsAction)
+            ),
+            None,
+        )
+        if recommendation is None or self._films is None:
+            return _chat(
+                "Не удалось подобрать и проверить новые фильмы; попробуй уточнить жанр."
+            )
+        return AssistantDecision(
+            actions=[
+                await self._films.recommend(recommendation, turn=turn, facts=facts)
             ]
-            if not recommendations:
-                return AssistantDecision(
-                    actions=[
-                        ChatAction(
-                            type=ActionType.CHAT,
-                            text="Не удалось подобрать и проверить новые фильмы; попробуй уточнить жанр.",
-                        )
-                    ]
-                )
-            return AssistantDecision(
-                actions=[
-                    await self._topped_up(
-                        recommendations[0],
-                        text=text,
-                        now=now,
-                        timezone=timezone,
-                        user_id=user_id,
-                        context=context,
-                        facts=facts,
-                    )
-                ]
-            )
-        actions: list[AssistantAction] = [
-            action
-            for action in informed.actions
-            # A second search would loop: answer from what memory already returned.
-            if not isinstance(action, SearchKnowledgeAction)
-        ]
-        if not actions:
-            return AssistantDecision(
-                actions=[
-                    ChatAction(
-                        type=ActionType.CHAT,
-                        text=ActionExecutor.format_facts(facts),
-                    )
-                ]
-            )
-        return AssistantDecision(actions=actions)
+        )
 
-    async def _topped_up(
-        self,
-        action: RecommendFilmsAction,
-        *,
-        text: str,
-        now: datetime,
-        timezone: str,
-        user_id: int,
-        context: str,
-        facts: list[KnowledgeFact],
-    ) -> RecommendFilmsAction:
-        """Ask once more when the catalogue swallowed most of the batch.
+    async def _reviewed(
+        self, actions: list[AssistantAction], *, turn: Turn, recalled: str
+    ) -> list[AssistantAction]:
+        """Give a long personalised list one pass against the recalled facts."""
+        if len(actions) != 1 or not isinstance(actions[0], ChatAction):
+            return actions
+        draft = actions[0].text
+        items = len(LIST_ITEM.findall(draft))
+        if items < MIN_REVIEWED_ITEMS:
+            return actions
+        logger.info("llm.answer.reviewed items=%s", items)
+        reviewed = _without_searches(
+            await turn.ask(
+                self._llm,
+                knowledge=recalled,
+                text=f"{turn.text}\n\n{draft}\n\n{REVIEW_INSTRUCTION}",
+                with_context=False,
+            )
+        )
+        checked = [action for action in reviewed if isinstance(action, ChatAction)]
+        # A review that answers with anything but chat, or drops the list, is
+        # no improvement: the draft already answered the question.
+        if len(checked) != 1 or len(LIST_ITEM.findall(checked[0].text)) != items:
+            logger.warning("llm.answer.review_discarded")
+            return actions
+        return list(checked)
 
-        The model tends to propose exactly as many candidates as the user asked
-        for, and against a catalogue of hundreds of films most of them are
-        already watched — leaving the user with a dead end. The rejected titles
-        go back with the request so the second batch is genuinely different.
+    async def _forgetting(
+        self, forgets: list[ForgetKnowledgeAction], *, turn: Turn
+    ) -> ForgetKnowledgeAction | ChatAction:
+        """Let the model pick, by ref, exactly the facts the request covers.
+
+        Erasing by resemblance alone would take the previous employer along
+        with the one the user asked to forget: the two sentences differ in a
+        single word. Only refs this recall produced may reach the executor.
         """
-        if self._knowledge is None:  # pragma: no cover - guarded by the caller
-            return action
+        assert self._knowledge is not None
         try:
-            watched = {
-                key
-                for title in await self._knowledge.watched_film_titles(user_id=user_id)
-                for key in title_keys(title)
-            }
-        except KnowledgeMemoryError as error:
-            logger.warning("films.topup.skipped reason=%s", error)
-            return action
-        # Verification comes first: it also rewrites a loose title to the one the
-        # directory knows, which is what the watched catalogue is spelled in.
-        real = await self._verified(action.candidates)
-        survivors = select_unwatched(real, watched=watched, limit=action.limit)
-        logger.info(
-            "films.recommend.proposed candidates=%s real=%s unwatched=%s limit=%s",
-            len(action.candidates),
-            len(real),
-            len(survivors),
-            action.limit,
-        )
-        if not watched or len(survivors) >= action.limit:
-            return action.model_copy(update={"candidates": survivors or real})
-        kept = {id(candidate) for candidate in survivors}
-        rejected = [
-            candidate.title for candidate in real if id(candidate) not in kept
-        ] or [candidate.title for candidate in action.candidates]
-        retry = KnowledgeFact(
-            fact="Эти кандидаты уже просмотрены и отклонены, предложи другие фильмы: "
-            + ", ".join(rejected)
-        )
-        second = await self._llm.parse_message(
-            text=text,
-            now=now,
-            timezone=timezone,
-            knowledge=json.dumps(
-                [fact.as_payload() for fact in [*facts, retry]], ensure_ascii=False
-            ),
-            **({"context": context} if context else {}),
-        )
-        extra = await self._verified(
-            [
-                candidate
-                for other in second.actions
-                if isinstance(other, RecommendFilmsAction)
-                for candidate in other.candidates
-            ]
-        )
-        topped_up = [*survivors, *extra][:MAX_FILM_CANDIDATES]
-        # An action must always carry a candidate; the executor reports an empty
-        # result in the one voice the user sees for it.
-        return action.model_copy(update={"candidates": topped_up or action.candidates})
-
-    async def _verified(self, candidates: list[FilmCandidate]) -> list[FilmCandidate]:
-        """Drop candidates no film directory knows, and canonicalise the rest.
-
-        The model renames a watched film to slip it past the catalogue and
-        invents titles outright; nothing inside the application can tell those
-        from real films. A directory failure degrades to the unverified batch:
-        an unchecked recommendation beats no answer at all.
-        """
-        if self._films is None or not candidates:
-            return candidates
-        found = await asyncio.gather(
-            *(
-                self._films.find(title=candidate.title, year=candidate.year)
-                for candidate in candidates
-            ),
-            return_exceptions=True,
-        )
-        for record in found:
-            if isinstance(record, BaseException):
-                # A partly checked batch would drop real films on a network blip.
-                logger.warning("films.directory.degraded reason=%s", record)
-                return candidates
-        verified: list[FilmCandidate] = []
-        for candidate, record in zip(candidates, found, strict=True):
-            if not isinstance(record, FilmRecord):
-                logger.info("films.candidate.unknown title=%r", candidate.title)
-                continue
-            verified.append(
-                candidate.model_copy(
-                    update={
-                        "title": record.title,
-                        "year": record.year or candidate.year,
-                        "aliases": [*candidate.aliases, record.original_title][
-                            :MAX_FILM_ALIASES
-                        ],
-                    }
+            found = [
+                fact
+                for forget in forgets
+                for fact in await self._knowledge.forget_candidates(
+                    user_id=turn.user_id, query=forget.query
                 )
+            ]
+        except KnowledgeMemoryError as error:
+            logger.warning("knowledge.forget.degraded reason=%s", error)
+            return ChatAction(type=ActionType.CHAT, text=MEMORY_UNAVAILABLE)
+        candidates = list({fact.ref: fact for fact in found if fact.ref}.values())
+        if not candidates:
+            return ChatAction(type=ActionType.CHAT, text=NOTHING_TO_FORGET)
+        informed = await turn.ask(
+            self._llm,
+            knowledge=json.dumps(
+                [fact.as_payload() for fact in candidates], ensure_ascii=False
+            ),
+        )
+        allowed = {fact.ref for fact in candidates}
+        refs = list(
+            dict.fromkeys(
+                ref
+                for action in informed.actions
+                if isinstance(action, ForgetKnowledgeAction)
+                for ref in action.refs
+                if ref in allowed
             )
-        return verified
+        )
+        if not refs:
+            return ChatAction(type=ActionType.CHAT, text=NOTHING_TO_FORGET)
+        return ForgetKnowledgeAction(
+            type=ActionType.FORGET_KNOWLEDGE,
+            query=forgets[0].query,
+            refs=refs[:MAX_FORGOTTEN_FACTS],
+        )
 
     async def _recall(
         self, searches: list[SearchKnowledgeAction], *, user_id: int
     ) -> tuple[str, list[KnowledgeFact]]:
-        if self._knowledge is None:  # pragma: no cover - guarded by the caller
+        knowledge = self._knowledge
+        if knowledge is None:  # pragma: no cover - guarded by the caller
             return "[]", []
-        facts: list[KnowledgeFact] = []
+        unique: dict[tuple[str, str, int], SearchKnowledgeAction] = {}
         for search in searches:
-            try:
-                if search.mode == "watched_film_catalogue":
-                    found = await self._knowledge.watched_film_catalogue(
-                        user_id=user_id
-                    )
-                elif search.mode == "recent_watched_films":
-                    found = await self._knowledge.recent_watched_films(
-                        user_id=user_id, limit=search.limit
-                    )
-                else:
-                    found = await self._knowledge.search(
-                        user_id=user_id, query=search.query, limit=search.limit
-                    )
-            except KnowledgeMemoryError as error:
-                logger.warning("knowledge.search.degraded reason=%s", error)
+            key = (
+                search.mode,
+                search.query if search.mode == "semantic" else "",
+                search.limit
+                if search.mode in {"semantic", "recent_watched_films"}
+                else 0,
+            )
+            unique.setdefault(key, search)
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_MEMORY_SEARCHES)
+
+        async def lookup(search: SearchKnowledgeAction) -> list[KnowledgeFact]:
+            async with semaphore:
+                return await knowledge.lookup(search, user_id=user_id)
+
+        results = await asyncio.gather(
+            *(lookup(search) for search in unique.values()), return_exceptions=True
+        )
+        facts: list[KnowledgeFact] = []
+        for found in results:
+            if isinstance(found, KnowledgeMemoryError):
+                logger.warning("knowledge.search.degraded reason=%s", found)
                 return (
                     json.dumps(
                         {"error": "knowledge memory is temporarily unavailable"},
@@ -374,6 +437,8 @@ class ProcessMessageUseCase:
                     ),
                     [],
                 )
+            if isinstance(found, BaseException):
+                raise found
             facts.extend(fact for fact in found if fact not in facts)
         payload = [fact.as_payload() for fact in facts]
         return json.dumps(payload, ensure_ascii=False), facts

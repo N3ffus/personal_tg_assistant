@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Sequence
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime
 from html import escape
 
 from src.application.ports.calendar import (
@@ -34,6 +34,7 @@ from src.domain.assistant.models import (
     DeleteEventAction,
     DeleteTaskAction,
     FilmCandidate,
+    ForgetKnowledgeAction,
     ListEventsAction,
     ListTasksAction,
     RecommendFilmsAction,
@@ -45,9 +46,8 @@ from src.domain.assistant.models import (
 from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
 from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
 from src.domain.calendar.models import CalendarEvent
-from src.domain.knowledge.films import select_unwatched, title_keys
+from src.domain.knowledge.films import select_unwatched
 from src.domain.knowledge.models import KnowledgeFact, KnowledgeSourceType
-from src.domain.tasks.models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,21 @@ def _film_line(candidate: FilmCandidate) -> str:
     return f"{title} — {reason}" if reason else title
 
 
+def format_facts(facts: list[KnowledgeFact]) -> str:
+    if not facts:
+        return "🧠 В долговременной памяти ничего не нашлось по этому запросу."
+    lines = ["🧠 Нашёл в памяти:"]
+    for fact in facts:
+        line = f"• {fact.fact}"
+        if fact.valid_from:
+            line += f" (с {fact.valid_from:%d.%m.%Y}"
+            line += f", до {fact.valid_until:%d.%m.%Y})" if fact.valid_until else ")"
+        elif fact.valid_until:
+            line += f" (до {fact.valid_until:%d.%m.%Y})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class ActionExecutor:
     def __init__(
         self,
@@ -71,7 +86,6 @@ class ActionExecutor:
         knowledge: KnowledgeService | None = None,
     ) -> None:
         self._calendar = calendar
-        self._pending_operations = pending_operations
         self._task_tracker = task_tracker
         self._knowledge = knowledge
         self._retrieval = RetrievalService(calendar=calendar, task_tracker=task_tracker)
@@ -196,6 +210,7 @@ class ActionExecutor:
                     action,
                     (
                         RememberKnowledgeAction,
+                        ForgetKnowledgeAction,
                         SearchKnowledgeAction,
                         SaveNoteAction,
                         RecommendFilmsAction,
@@ -328,14 +343,18 @@ class ActionExecutor:
             )
             return f"🧠 Запомнил: {action.content}"
 
+        if isinstance(action, ForgetKnowledgeAction):
+            if self._knowledge is None:
+                return "⚠️ Долговременная память отключена, забывать нечего."
+            forgotten = await self._knowledge.forget(user_id=user_id, refs=action.refs)
+            if not forgotten:
+                return "В памяти этого нет — забывать нечего."
+            return "🧹 Забыл:\n" + "\n".join(f"• {text}" for text in forgotten)
+
         if isinstance(action, RecommendFilmsAction):
             if self._knowledge is None:
                 return MEMORY_UNAVAILABLE
-            watched = {
-                key
-                for title in await self._knowledge.watched_film_titles(user_id=user_id)
-                for key in title_keys(title)
-            }
+            watched = await self._knowledge.watched_title_keys(user_id=user_id)
             if not watched:
                 return "Не удалось проверить историю просмотров; не могу исключить уже просмотренные фильмы."
             selected = select_unwatched(
@@ -352,24 +371,22 @@ class ActionExecutor:
                     "Из того, что подобралось, ты уже всё смотрел. Скажи жанр, "
                     "настроение или год — поищу точнее."
                 )
-            return "В твоём списке просмотренных нет:\n" + "\n".join(
+            reply = "В твоём списке просмотренных нет:\n" + "\n".join(
                 _film_line(candidate) for candidate in selected
             )
+            if len(selected) < action.limit:
+                # Two films silently answering «топ 10» read as a broken bot.
+                reply += (
+                    f"\n\nНепросмотренных нашлось только {len(selected)} из "
+                    f"{action.limit}. Скажи жанр или настроение — поищу ещё."
+                )
+            return reply
 
         if isinstance(action, SearchKnowledgeAction):
             if self._knowledge is None:
                 return "⚠️ Долговременная память отключена, поиск по ней недоступен."
-            if action.mode == "watched_film_catalogue":
-                facts = await self._knowledge.watched_film_catalogue(user_id=user_id)
-            elif action.mode == "recent_watched_films":
-                facts = await self._knowledge.recent_watched_films(
-                    user_id=user_id, limit=action.limit
-                )
-            else:
-                facts = await self._knowledge.search(
-                    user_id=user_id, query=action.query, limit=action.limit
-                )
-            return self.format_facts(facts)
+            facts = await self._knowledge.lookup(action, user_id=user_id)
+            return format_facts(facts)
 
         raise ValueError(f"Unsupported action: {type(action)!r}")
 
@@ -400,62 +417,8 @@ class ActionExecutor:
     def _source_id(*, message_id: int | None, now: datetime) -> str:
         return str(message_id) if message_id is not None else f"{now:%Y%m%dT%H%M%S%z}"
 
-    @staticmethod
-    def format_facts(facts: list[KnowledgeFact]) -> str:
-        if not facts:
-            return "🧠 В долговременной памяти ничего не нашлось по этому запросу."
-        lines = ["🧠 Нашёл в памяти:"]
-        for fact in facts:
-            line = f"• {fact.fact}"
-            if fact.valid_from:
-                line += f" (с {fact.valid_from:%d.%m.%Y}"
-                line += (
-                    f", до {fact.valid_until:%d.%m.%Y})" if fact.valid_until else ")"
-                )
-            elif fact.valid_until:
-                line += f" (до {fact.valid_until:%d.%m.%Y})"
-            lines.append(line)
-        return "\n".join(lines)
-
-    @staticmethod
-    def format_tasks(tasks: list[Task]) -> str:
-        if not tasks:
-            return "В настроенной команде Linear нет неархивных задач."
-        lines = [f"📋 Задачи Linear — {len(tasks)} (без архивных):"]
-        for task in tasks:
-            lines.append(
-                f"• {task.identifier}: {task.title} — {task.status}\n{task.url}"
-            )
-        return "\n".join(lines)
-
     async def browse(self, *, user_id: int, data: str) -> ResultPage | str:
         return await self._retrieval.navigate(user_id=user_id, data=data)
-
-    @staticmethod
-    def format_events(
-        events: list[CalendarEvent], *, timezone: tzinfo | None = None
-    ) -> str:
-        if not events:
-            return "Ближайших событий не найдено."
-        lines = ["📅 Ближайшие события Google Calendar (до 10):"]
-        for event in events:
-            if event.all_day:
-                when = f"{event.starts_at:%d.%m.%Y}"
-                last_day = event.ends_at - timedelta(days=1)
-                if last_day.date() > event.starts_at.date():
-                    when += f"–{last_day:%d.%m.%Y}"
-                when += " (весь день)"
-            else:
-                start = (
-                    event.starts_at.astimezone(timezone)
-                    if timezone
-                    else event.starts_at
-                )
-                when = f"{start:%d.%m.%Y %H:%M %Z}"
-            lines.append(f"• {when} — {event.title}")
-            if event.html_link:
-                lines.append(event.html_link)
-        return "\n".join(lines)
 
     @staticmethod
     def _event_result(verb: str, event: CalendarEvent) -> str:

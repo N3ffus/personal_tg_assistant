@@ -25,8 +25,8 @@ def valid_settings(**overrides: object) -> Settings:
 def test_settings_apply_safe_application_defaults() -> None:
     settings = valid_settings()
 
-    assert settings.llm_base_url == "https://api.gonkagate.com/v1"
-    assert settings.llm_model == "gpt-5.6"
+    assert settings.llm_base_url == "https://api.deepinfra.com/v1/openai"
+    assert settings.llm_model == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert settings.app_timezone == "Europe/Moscow"
     assert settings.database_path == "data/assistant.db"
     assert settings.http_host == "0.0.0.0"
@@ -130,3 +130,14 @@ def test_settings_allow_plain_http_only_for_loopback_services() -> None:
         settings.google_oauth_redirect_uri
         == "http://localhost:8080/oauth/google/callback/"
     )
+
+
+def test_embedding_defaults_match_the_default_provider() -> None:
+    """DeepInfra serves bge-m3; an OpenAI model name there fails every embed."""
+    settings = valid_settings()
+
+    assert settings.resolved_graphiti_embedding_base_url.startswith(
+        "https://api.deepinfra.com/"
+    )
+    assert settings.graphiti_embedding_model == "BAAI/bge-m3"
+    assert settings.graphiti_embedding_dim == 1024

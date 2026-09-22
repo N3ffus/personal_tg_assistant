@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -127,3 +128,37 @@ async def test_process_message_propagates_executor_failure() -> None:
         )
 
     assert exc.value is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_every_turn_logs_its_llm_calls_and_latency(
+    fails: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow reply was once blamed on the graph; the turn line tells them apart."""
+    llm = SimpleNamespace(
+        parse_message=AsyncMock(
+            return_value=AssistantDecision(
+                actions=[ChatAction(type=ActionType.CHAT, text="Ответ")]
+            )
+        )
+    )
+    executor = SimpleNamespace(
+        execute_many=AsyncMock(
+            side_effect=RuntimeError("down") if fails else None, return_value="Ответ"
+        )
+    )
+    use_case = ProcessMessageUseCase(llm=llm, action_executor=executor)  # type: ignore[arg-type]
+
+    caplog.set_level("INFO")
+    with pytest.raises(RuntimeError) if fails else nullcontext():
+        await use_case.execute(
+            text="Вопрос",
+            now=datetime(2026, 9, 3, 12, 0, tzinfo=UTC),
+            timezone="Europe/Moscow",
+            user_id=42,
+        )
+
+    [line] = [r.getMessage() for r in caplog.records if "turn.completed" in r.message]
+    assert f"outcome={'failed' if fails else 'ok'}" in line
+    assert "llm_calls=1 " in line

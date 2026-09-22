@@ -1,9 +1,10 @@
+import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -17,6 +18,7 @@ from src.application.services.action_executor import (
     MEMORY_UNAVAILABLE,
     ActionExecutor,
 )
+from src.application.services.film_recommendations import MAX_TOPUP_ROUNDS
 from src.application.services.knowledge import KnowledgeService
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.config import Settings
@@ -25,6 +27,7 @@ from src.domain.assistant.models import (
     AssistantDecision,
     ChatAction,
     FilmCandidate,
+    ForgetKnowledgeAction,
     RecommendFilmsAction,
     RememberKnowledgeAction,
     SaveNoteAction,
@@ -32,11 +35,13 @@ from src.domain.assistant.models import (
 )
 from src.domain.knowledge.films import (
     FilmRecord,
+    requested_count,
     select_unwatched,
     title_key,
     title_keys,
 )
 from src.domain.knowledge.models import (
+    MAX_PROFILE_FACTS,
     KnowledgeEpisode,
     KnowledgeFact,
     KnowledgeSourceType,
@@ -78,6 +83,7 @@ def edge(
     invalid_at: datetime | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        uuid=f"edge-{abs(hash(fact))}",
         fact=fact,
         group_id=group_id,
         episodes=episodes if episodes is not None else ["episode-1"],
@@ -86,29 +92,37 @@ def edge(
     )
 
 
-def episodic(uuid: str, *, name: str, group_id: str) -> SimpleNamespace:
-    return SimpleNamespace(uuid=uuid, name=name, group_id=group_id)
+def episodic(
+    uuid: str, *, name: str, group_id: str, valid_at: datetime | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(uuid=uuid, name=name, group_id=group_id, valid_at=valid_at)
 
 
 def found_episode(
     *,
-    content: str = "Пользователь: родился 02.05.2003 в г. Красноярск",
+    content: str = "Пользователь: родился 17.11.2001 в г. Лесноград",
     group_id: str,
     name: str = "telegram_message:627",
     valid_at: datetime | None = NOW,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        content=content, group_id=group_id, name=name, valid_at=valid_at
+        uuid=f"found-{name}",
+        content=content,
+        group_id=group_id,
+        name=name,
+        valid_at=valid_at,
     )
 
 
 def entity(
     *,
-    name: str = "Красноярск",
+    name: str = "Лесноград",
     group_id: str,
-    summary: str | None = "Красноярск — город рождения Андрея (род. 02.05.2003).",
+    summary: str | None = "Лесноград — город рождения Льва (род. 17.11.2001).",
 ) -> SimpleNamespace:
-    return SimpleNamespace(name=name, group_id=group_id, summary=summary)
+    return SimpleNamespace(
+        uuid=f"node-{name}", name=name, group_id=group_id, summary=summary
+    )
 
 
 class FakeGraphiti:
@@ -138,6 +152,7 @@ class FakeGraphiti:
             self.embedder.create = AsyncMock(side_effect=embedding_error)
         self.queries: list[dict[str, Any]] = []
         self.driver = SimpleNamespace(execute_query=self._execute_query)
+        self.clients = self
 
     async def _execute_query(
         self, query: str, **kwargs: Any
@@ -175,6 +190,16 @@ def awaited_kwargs(mock: AsyncMock) -> Mapping[str, Any]:
 
 def memory(graphiti: FakeGraphiti) -> GraphitiKnowledgeMemory:
     return GraphitiKnowledgeMemory(graphiti=graphiti)  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def fake_graphiti_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def search(*, clients: FakeGraphiti, **kwargs: Any) -> SimpleNamespace:
+        return await clients.search_(**kwargs)
+
+    monkeypatch.setattr(
+        "src.infrastructure.knowledge.graphiti_memory.graphiti_search", search
+    )
 
 
 # --- namespace isolation -----------------------------------------------------
@@ -231,6 +256,7 @@ def test_fact_payload_is_compact() -> None:
         "fact": "Работает в A",
         "valid_from": NOW.isoformat(),
         "valid_until": None,
+        "stated_at": None,
         "source": "note:1",
     }
 
@@ -449,7 +475,7 @@ async def test_adapter_surfaces_facts_kept_only_on_entity_nodes(
 
     assert [fact.fact for fact in facts] == [
         "Пользователь называется Андрей",
-        "Красноярск — город рождения Андрея (род. 02.05.2003).",
+        "Лесноград — город рождения Льва (род. 17.11.2001).",
     ]
 
 
@@ -485,7 +511,7 @@ async def test_adapter_drops_node_summaries_that_repeat_a_fact(
 
     assert [fact.fact for fact in facts] == [
         "Пользователь называется Андрей",
-        "Красноярск — город рождения Андрея (род. 02.05.2003).",
+        "Лесноград — город рождения Льва (род. 17.11.2001).",
     ]
     # The edge keeps its provenance: the duplicate dropped is the summary.
     assert facts[0].source == "note:7"
@@ -507,8 +533,9 @@ async def test_adapter_surfaces_the_episode_when_extraction_kept_nothing() -> No
     assert facts == [
         KnowledgeFact(
             # The speaker prefix is Graphiti's parsing aid, not part of the fact.
-            fact="родился 02.05.2003 в г. Красноярск",
+            fact="родился 17.11.2001 в г. Лесноград",
             valid_from=NOW,
+            stated_at=NOW,
             source="telegram_message:627",
         )
     ]
@@ -552,7 +579,7 @@ async def test_adapter_embeds_the_episode_it_stores() -> None:
     await memory(graphiti).remember(
         namespace="user_abc",
         episode=KnowledgeEpisode(
-            content="Пользователь родился 02.05.2003",
+            content="Пользователь родился 17.11.2001",
             source_id="627",
             source_type=KnowledgeSourceType.TELEGRAM_MESSAGE,
             reference_time=NOW,
@@ -599,8 +626,9 @@ async def test_adapter_recalls_episodes_by_meaning() -> None:
     graphiti = FakeGraphiti(
         similar=[
             {
+                "uuid": "similar-627",
                 "name": "telegram_message:627",
-                "content": "Пользователь: Пользователь родился 02.05.2003",
+                "content": "Пользователь: Пользователь родился 17.11.2001",
                 "valid_at": NOW,
             }
         ]
@@ -612,8 +640,9 @@ async def test_adapter_recalls_episodes_by_meaning() -> None:
 
     assert facts == [
         KnowledgeFact(
-            fact="Пользователь родился 02.05.2003",
+            fact="Пользователь родился 17.11.2001",
             valid_from=NOW,
+            stated_at=NOW,
             source="telegram_message:627",
         )
     ]
@@ -631,6 +660,7 @@ async def test_adapter_never_repeats_an_episode_found_both_ways() -> None:
         ],
         similar=[
             {
+                "uuid": "similar-627",
                 "name": "telegram_message:627",
                 "content": "Пользователь: Один факт",
                 "valid_at": NOW,
@@ -662,6 +692,140 @@ async def test_adapter_still_recalls_when_the_query_cannot_be_embedded(
         record.getMessage().startswith("knowledge.embed.failed")
         for record in caplog.records
     )
+    from graphiti_core.search.search_config import EdgeSearchMethod, NodeSearchMethod
+
+    config = graphiti.searches[0]["config"]
+    assert config.edge_config.search_methods == [EdgeSearchMethod.bm25]
+    assert config.node_config.search_methods == [NodeSearchMethod.bm25]
+    graphiti.embedder.create.assert_awaited_once()
+    assert not graphiti.queries
+    # Fallback is request-local: the next working embedding restores vectors.
+    graphiti.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+    await memory(graphiti).search(namespace="user_abc", query="работа", limit=5)
+    assert (
+        EdgeSearchMethod.cosine_similarity
+        in graphiti.searches[1]["config"].edge_config.search_methods
+    )
+
+
+@pytest.mark.asyncio
+async def test_cached_query_vector_is_shared_but_facts_and_namespaces_stay_fresh() -> (
+    None
+):
+    graph = FakeGraphiti()
+    adapter = memory(graph)
+    assert (
+        await adapter.search(namespace="user_abc", query="дата рождения", limit=5) == []
+    )
+    graph.found_episodes = [found_episode(group_id="user_abc")]
+    facts = await adapter.search(namespace="user_abc", query="дата рождения", limit=5)
+    assert "17.11.2001" in facts[0].fact
+    assert (
+        await adapter.search(namespace="user_other", query="дата рождения", limit=5)
+        == []
+    )
+    graph.embedder.create.assert_awaited_once()
+    assert len(graph.searches) == 3
+    for graph_search, episode_search in zip(graph.searches, graph.queries, strict=True):
+        assert graph_search["query_vector"] == episode_search["embedding"]
+        assert graph_search["group_ids"] == [episode_search["namespace"]]
+
+
+@pytest.mark.asyncio
+async def test_query_vector_cache_expires_and_evicts_least_recently_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(
+        "src.infrastructure.knowledge.graphiti_memory.monotonic", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        "src.infrastructure.knowledge.graphiti_memory.QUERY_EMBEDDING_CACHE_SIZE", 2
+    )
+    graph = FakeGraphiti()
+    adapter = memory(graph)
+    for query in ["one", "two", "one", "three", "two"]:
+        await adapter.search(namespace="user_abc", query=query, limit=5)
+    assert graph.embedder.create.await_count == 4
+    clock[0] = 301
+    await adapter.search(namespace="user_abc", query="two", limit=5)
+    assert graph.embedder.create.await_count == 5
+
+
+@pytest.mark.asyncio
+async def test_empty_search_skips_embedding_and_graph() -> None:
+    graph = FakeGraphiti()
+    assert await memory(graph).search(namespace="user_abc", query=" \n", limit=5) == []
+    graph.embedder.create.assert_not_awaited()
+    assert not graph.searches and not graph.queries
+
+
+@pytest.mark.asyncio
+async def test_graph_and_episode_searches_run_concurrently() -> None:
+    graph = FakeGraphiti()
+    graph_started, episode_started = asyncio.Event(), asyncio.Event()
+    original_search = graph.search_
+    original_query = graph.driver.execute_query
+
+    async def search(**kwargs: Any) -> SimpleNamespace:
+        graph_started.set()
+        await episode_started.wait()
+        return await original_search(**kwargs)
+
+    async def query(cypher: str, **kwargs: Any) -> Any:
+        episode_started.set()
+        await graph_started.wait()
+        return await original_query(cypher, **kwargs)
+
+    graph.search_ = search  # type: ignore[method-assign]
+    graph.driver.execute_query = query
+    await asyncio.wait_for(
+        memory(graph).search(namespace="user_abc", query="факт", limit=5), timeout=2
+    )
+    graph.embedder.create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_recall_cancels_both_graph_reads() -> None:
+    graph = FakeGraphiti()
+    started = [asyncio.Event(), asyncio.Event()]
+    cancelled: set[int] = set()
+
+    async def block(index: int) -> Any:
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.add(index)
+
+    async def search(**kwargs: Any) -> Any:
+        return await block(0)
+
+    async def query(*args: Any, **kwargs: Any) -> Any:
+        return await block(1)
+
+    graph.search_ = search  # type: ignore[method-assign]
+    graph.driver.execute_query = query
+    task = asyncio.create_task(
+        memory(graph).search(namespace="user_abc", query="факт", limit=5)
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in started)), timeout=2
+        )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert cancelled == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_episode_query_failure_keeps_other_search_layers() -> None:
+    graph = FakeGraphiti(found_episodes=[found_episode(group_id="user_abc")])
+    graph.driver.execute_query = AsyncMock(side_effect=RuntimeError("similarity down"))
+    facts = await memory(graph).search(namespace="user_abc", query="родился", limit=5)
+    assert "17.11.2001" in facts[0].fact
 
 
 @pytest.mark.asyncio
@@ -681,12 +845,12 @@ async def test_adapter_never_returns_a_node_from_another_namespace() -> None:
 @pytest.mark.asyncio
 async def test_adapter_falls_back_to_the_node_name_without_a_summary() -> None:
     graphiti = FakeGraphiti(
-        nodes=[entity(name="Красноярск", group_id="user_abc", summary=None)]
+        nodes=[entity(name="Лесноград", group_id="user_abc", summary=None)]
     )
 
     facts = await memory(graphiti).search(namespace="user_abc", query="x", limit=5)
 
-    assert [fact.fact for fact in facts] == ["Красноярск"]
+    assert [fact.fact for fact in facts] == ["Лесноград"]
 
 
 @pytest.mark.asyncio
@@ -1418,6 +1582,137 @@ async def test_a_watched_batch_is_regenerated_once_with_the_rejects_named() -> N
     ]
 
 
+@pytest.mark.parametrize(
+    ("text", "count"),
+    [
+        ("Посоветуй топ 10 фильмов для меня", 10),
+        ("Посоветуй топ-5 фильмов", 5),
+        ("дай 7 лучших фильмов, которые я не смотрел", 7),
+        ("Посоветуй пять фильмов", 5),
+        ("Порекомендуй десять хороших фильмов на вечер", 10),
+        ("Посоветуй пару фильмов", 2),
+        ("Посоветуй один фильм", 1),
+        ("Подкинь десяток фильмов", 10),
+        ("Посоветуй 20 фильмов", 10),
+        ("Посоветуй фильмы, которые я не смотрел", None),
+        ("Посоветуй фильм 2019 года", None),
+        ("Посоветуй фильмы про 90-е", None),
+    ],
+)
+def test_requested_count_reads_the_number_the_user_asked_for(
+    text: str, count: int | None
+) -> None:
+    assert requested_count(text) == count
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_count_overrides_the_limit_the_model_chose() -> None:
+    """«Посоветуй топ 10 фильмов» reached production with limit=3 (2026-09-15)."""
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    batch = recommending(*(f"Новый фильм {i}" for i in range(12)), limit=3)
+    process, llm, executed = use_case(decisions=[batch, batch], knowledge=knowledge)
+
+    await process.execute(
+        text="Посоветуй топ 10 фильмов для меня",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 2
+    action = executed.execute_many.await_args.args[0][0]
+    assert action.limit == 10
+    assert len(action.candidates) == 10
+
+
+@pytest.mark.asyncio
+async def test_regeneration_continues_until_the_requested_count_is_filled() -> None:
+    """Production showed 2 of 10: the single retry also came back watched."""
+    watched = [f"Классика {i}" for i in range(20)]
+    knowledge = service(watched_film_titles=AsyncMock(return_value=watched))
+    first = recommending(*watched[:10], "Новый 1", limit=4)
+    second = recommending(*watched[10:], "Новый 1", "Новый 2", limit=4)
+    third = recommending("Новый 3", "Новый 4", "Новый 5", limit=4)
+    process, llm, executed = use_case(
+        decisions=[first, first, second, third], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 4
+    # Every round names everything rejected so far, not just the last batch.
+    last_retry = llm.parse_message.await_args.kwargs["knowledge"]
+    assert "Классика 0" in last_retry and "Классика 19" in last_retry
+    action = executed.execute_many.await_args.args[0][0]
+    assert [candidate.title for candidate in action.candidates] == [
+        "Новый 1",
+        "Новый 2",
+        "Новый 3",
+        "Новый 4",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_regeneration_gives_up_after_a_bounded_number_of_rounds() -> None:
+    watched = ["Контакт", "Дюна"]
+    knowledge = service(watched_film_titles=AsyncMock(return_value=watched))
+    batch = recommending(*watched, "Магнолия", limit=5)
+    process, llm, executed = use_case(decisions=[batch] * 10, knowledge=knowledge)
+
+    await process.execute(
+        text="Посоветуй фильмы которые я не смотрел",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 2 + MAX_TOPUP_ROUNDS
+    action = executed.execute_many.await_args.args[0][0]
+    assert [candidate.title for candidate in action.candidates] == ["Магнолия"]
+
+
+@pytest.mark.asyncio
+async def test_a_short_list_says_it_is_shorter_than_asked() -> None:
+    action = RecommendFilmsAction(
+        type=ActionType.RECOMMEND_FILMS,
+        limit=10,
+        candidates=[
+            FilmCandidate(title="Контакт", reason="просмотрен"),
+            FilmCandidate(title="Дюна", reason="Эпос"),
+            FilmCandidate(title="Магнолия", reason="Драма"),
+        ],
+    )
+
+    result = await executor(
+        knowledge=service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    ).execute_many([action], user_id=42, now=NOW)
+
+    assert isinstance(result, str)
+    assert "«Дюна» — Эпос" in result and "«Магнолия» — Драма" in result
+    assert "только 2 из 10" in result
+
+
+@pytest.mark.asyncio
+async def test_a_full_list_carries_no_shortfall_note() -> None:
+    action = RecommendFilmsAction(
+        type=ActionType.RECOMMEND_FILMS,
+        limit=1,
+        candidates=[FilmCandidate(title="Дюна", reason="Эпос")],
+    )
+
+    result = await executor(
+        knowledge=service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
+    ).execute_many([action], user_id=42, now=NOW)
+
+    assert isinstance(result, str)
+    assert "только" not in result
+
+
 @pytest.mark.asyncio
 async def test_a_full_batch_of_new_films_is_never_regenerated() -> None:
     knowledge = service(watched_film_titles=AsyncMock(return_value=["Контакт"]))
@@ -1526,6 +1821,130 @@ async def test_recent_films_convert_neo4j_dates_and_handle_unavailability() -> N
 
 
 @pytest.mark.asyncio
+async def test_an_updated_fact_keeps_the_time_it_was_stated() -> None:
+    """Graphiti kept the superseded edge's valid_at when the city changed."""
+    moved = NOW
+    graph = FakeGraphiti(
+        edges=[
+            edge(
+                fact="Пользователь живёт в Леснограде",
+                group_id=namespace_for(42),
+                episodes=["said-later"],
+                valid_at=NOW - timedelta(days=40),
+            )
+        ]
+    )
+    episodes = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                uuid="said-later",
+                name="telegram_message:9",
+                group_id=namespace_for(42),
+                valid_at=moved,
+            )
+        ]
+    )
+    monkeypatched = "src.infrastructure.knowledge.graphiti_memory.EpisodicNode"
+    with patch(monkeypatched, SimpleNamespace(get_by_uuids=episodes)):
+        facts = await memory(graph).search(
+            namespace=namespace_for(42), query="город", limit=5
+        )
+
+    assert facts[0].valid_from == NOW - timedelta(days=40)
+    assert facts[0].stated_at == moved
+    assert facts[0].as_payload()["stated_at"] == moved.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_profile_reads_every_statement_oldest_first_without_films() -> None:
+    from neo4j.time import DateTime
+
+    older = NOW - timedelta(days=200)
+    graph = FakeGraphiti()
+    # The query ranks newest first so the limit keeps the recent statements.
+    query = AsyncMock(
+        return_value=(
+            [
+                {
+                    "uuid": "e2",
+                    "name": "telegram_message:2",
+                    "content": "Пользователь: Мой вес 78 кг",
+                    "valid_at": DateTime.from_native(NOW),
+                },
+                {
+                    "uuid": "e1",
+                    "name": "telegram_message:1",
+                    "content": "Пользователь: Мой вес 84 кг",
+                    "valid_at": older,
+                },
+                {
+                    "uuid": "e0",
+                    "name": "telegram_message:0",
+                    "content": "Мой вес 84 кг",
+                    "valid_at": older,
+                },
+            ],
+            None,
+            None,
+        )
+    )
+    graph.driver.execute_query = query
+
+    facts = await memory(graph).profile_facts(namespace=namespace_for(42), limit=300)
+
+    assert [(fact.fact, fact.valid_from) for fact in facts] == [
+        ("Мой вес 84 кг", older),
+        ("Мой вес 78 кг", NOW),
+    ]
+    args = query.await_args
+    assert args is not None
+    assert args.kwargs["namespace"] == namespace_for(42)
+    assert args.kwargs["limit"] == 300
+    assert "structured film export" in args.args[0]
+    query.side_effect = RuntimeError("offline")
+    with pytest.raises(KnowledgeMemoryError):
+        await memory(graph).profile_facts(namespace=namespace_for(42), limit=300)
+
+
+@pytest.mark.asyncio
+async def test_profile_mode_hands_the_whole_profile_to_the_answer_turn() -> None:
+    profile = AsyncMock(
+        return_value=[
+            KnowledgeFact(fact="В 2019 году ездил на Байкал", valid_from=NOW),
+            KnowledgeFact(fact="В феврале 2026 ездили с Машей в Карелию"),
+        ]
+    )
+    semantic = AsyncMock()
+    knowledge = KnowledgeService(
+        memory=SimpleNamespace(profile_facts=profile, search=semantic)
+    )
+    decision = AssistantDecision(
+        actions=[
+            SearchKnowledgeAction(
+                type=ActionType.SEARCH_KNOWLEDGE, query="поездки", mode="profile"
+            )
+        ]
+    )
+    process, llm, _ = use_case(
+        decisions=[decision, chat("Байкал, Карелия")], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Составь все мои поездки по годам",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    profile.assert_awaited_once_with(
+        namespace=namespace_for(42), limit=MAX_PROFILE_FACTS
+    )
+    semantic.assert_not_awaited()
+    recalled = awaited_kwargs(llm.parse_message)["knowledge"]
+    assert "Байкал" in recalled and "Карелию" in recalled
+
+
+@pytest.mark.asyncio
 async def test_plain_questions_never_touch_memory() -> None:
     backend = AsyncMock()
     knowledge = KnowledgeService(memory=SimpleNamespace(search=backend))
@@ -1568,12 +1987,66 @@ async def test_recalled_facts_are_handed_back_to_the_agent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_multiple_memory_requests_are_bounded_deduplicated_and_keep_order() -> (
+    None
+):
+    active = 0
+    peak = 0
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    async def find(*, namespace: str, query: str, limit: int) -> list[KnowledgeFact]:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        if active == 4:
+            ready.set()
+        try:
+            await release.wait()
+            return [KnowledgeFact(fact=query), KnowledgeFact(fact="Общий факт")]
+        finally:
+            active -= 1
+
+    backend = AsyncMock(side_effect=find)
+    process, _, _ = use_case(decisions=[], knowledge=service(search=backend))
+    searches = [
+        SearchKnowledgeAction(type=ActionType.SEARCH_KNOWLEDGE, query=str(i))
+        for i in range(6)
+    ]
+    task = asyncio.create_task(process._recall([*searches, searches[0]], user_id=42))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        assert peak == 4
+    finally:
+        release.set()
+        _, facts = await task
+    assert backend.await_count == 6
+    assert [fact.fact for fact in facts] == ["0", "Общий факт", "1", "2", "3", "4", "5"]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_catalogue_failure_is_not_silenced() -> None:
+    backend = SimpleNamespace(lookup=AsyncMock(side_effect=ValueError("bad catalogue")))
+    process, _, _ = use_case(decisions=[], knowledge=backend)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bad catalogue"):
+        await process._recall(
+            [
+                SearchKnowledgeAction(
+                    type=ActionType.SEARCH_KNOWLEDGE,
+                    query="фильмы",
+                    mode="watched_film_catalogue",
+                )
+            ],
+            user_id=42,
+        )
+
+
+@pytest.mark.asyncio
 async def test_a_second_search_never_loops() -> None:
     knowledge = service(
         search=AsyncMock(return_value=[KnowledgeFact(fact="Работает в B")])
     )
-    process, _, action_executor = use_case(
-        decisions=[searching(), searching()], knowledge=knowledge
+    process, llm, action_executor = use_case(
+        decisions=[searching(), searching(), searching()], knowledge=knowledge
     )
 
     await process.execute(
@@ -1585,6 +2058,32 @@ async def test_a_second_search_never_loops() -> None:
     assert executed == [
         ChatAction(type=ActionType.CHAT, text="🧠 Нашёл в памяти:\n• Работает в B")
     ]
+    # One decision, one answer turn, one retry: never more.
+    assert llm.parse_message.await_count == 3
+    # Only the retry is told the search is done; the user's words stay first.
+    retry = awaited_kwargs(llm.parse_message)["text"]
+    assert retry.startswith("Где я работаю?") and "уже прочитана" in retry
+
+
+@pytest.mark.asyncio
+async def test_an_answer_turn_that_searches_again_is_asked_once_more() -> None:
+    """«Посоветуй пиццу» got the raw fact list instead of advice (2026-09-14)."""
+    knowledge = service(
+        search=AsyncMock(return_value=[KnowledgeFact(fact="Не любит грибы")])
+    )
+    advice = chat("Возьми Маргариту — в ней нет грибов.")
+    process, llm, action_executor = use_case(
+        decisions=[searching("пицца еда"), searching("пицца"), advice],
+        knowledge=knowledge,
+    )
+
+    await process.execute(
+        text="Посоветуй пиццу", now=NOW, timezone="Europe/Moscow", user_id=42
+    )
+
+    assert llm.parse_message.await_count == 3
+    assert "Не любит грибы" in awaited_kwargs(llm.parse_message)["knowledge"]
+    assert action_executor.execute_many.await_args.args[0] == advice.actions
 
 
 @pytest.mark.asyncio
@@ -1615,3 +2114,408 @@ async def test_search_is_skipped_without_a_configured_memory() -> None:
     assert llm.parse_message.await_count == 1
     assert action_executor.execute_many.await_args is not None
     assert action_executor.execute_many.await_args.args[0] == searching().actions
+
+
+# --- forgetting ----------------------------------------------------------------
+
+
+def forgetting(query: str = "работает в Ozon", *refs: str) -> AssistantDecision:
+    return AssistantDecision(
+        actions=[
+            ForgetKnowledgeAction(
+                type=ActionType.FORGET_KNOWLEDGE, query=query, refs=list(refs)
+            )
+        ]
+    )
+
+
+class ForgettingDriver:
+    """A namespace holding one current and one past employer."""
+
+    def __init__(self) -> None:
+        self.queries: list[dict[str, Any]] = []
+
+    async def execute_query(
+        self, query: str, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], None, None]:
+        self.queries.append({"query": query, **kwargs})
+        rows: list[dict[str, Any]] = []
+        if "RETURN fact.fact AS text" in query and kwargs["uuids"]:
+            rows = [{"text": "Пользователь работает в Ozon"}]
+        elif "DELETE fact" in query and kwargs["texts"]:
+            rows = [
+                {
+                    "text": "Пользователь работает в Ozon",
+                    "source": "me",
+                    "target": "ozon",
+                }
+            ]
+        elif "DETACH DELETE episode" in query and kwargs["contents"]:
+            rows = [{"content": "Пользователь: Пользователь работает в Ozon"}]
+        elif "RETURN node.uuid AS uuid, node.summary AS summary" in query:
+            rows = [
+                {
+                    "uuid": "me",
+                    "summary": "Пользователь работает в Яндексе\n"
+                    "Пользователь работает в Ozon",
+                },
+                {"uuid": "yandex", "summary": "Пользователь работает в Яндексе"},
+            ]
+        return rows, None, None
+
+    def matching(self, fragment: str) -> list[dict[str, Any]]:
+        return [query for query in self.queries if fragment in query["query"]]
+
+
+def test_fact_payload_shows_a_ref_only_when_the_fact_can_be_forgotten() -> None:
+    fact = KnowledgeFact(fact="Работает в A", ref="edge:1")
+
+    assert fact.as_payload()["ref"] == "edge:1"
+    assert "ref" not in KnowledgeFact(fact="Работает в A").as_payload()
+
+
+@pytest.mark.asyncio
+async def test_adapter_hands_refs_to_forgetting_but_not_to_answers() -> None:
+    graphiti = FakeGraphiti(
+        edges=[
+            edge(fact="Пользователь работает в Ozon", group_id="user_abc", episodes=[])
+        ]
+    )
+
+    candidates = await memory(graphiti).forget_candidates(
+        namespace="user_abc", query="Ozon", limit=5
+    )
+    answers = await memory(graphiti).search(namespace="user_abc", query="Ozon", limit=5)
+
+    assert [fact.ref for fact in candidates] == [f"edge:{graphiti.edges[0].uuid}"]
+    assert [fact.ref for fact in answers] == [None]
+
+
+@pytest.mark.asyncio
+async def test_forgetting_erases_every_copy_of_the_fact_and_nothing_else() -> None:
+    driver = ForgettingDriver()
+    graphiti = FakeGraphiti()
+    graphiti.driver = driver  # type: ignore[assignment]
+
+    forgotten = await memory(graphiti).forget(
+        namespace="user_abc", refs=["edge:ozon-edge", "bogus"]
+    )
+
+    assert forgotten == ["Пользователь работает в Ozon"]
+    assert all(query["namespace"] == "user_abc" for query in driver.queries)
+    [edges] = driver.matching("DELETE fact")
+    assert edges["uuids"] == ["ozon-edge"]
+    assert edges["texts"] == ["Пользователь работает в Ozon"]
+    [episodes] = driver.matching("DETACH DELETE episode")
+    # The episode still carries the speaker prefix remember added.
+    assert "Пользователь: Пользователь работает в Ozon" in episodes["contents"]
+    # The past employer stays in the summary; only the forgotten line goes.
+    [summary] = driver.matching("SET node.summary")
+    assert summary["uuid"] == "me"
+    assert summary["summary"] == "Пользователь работает в Яндексе"
+    [orphans] = driver.matching("DETACH DELETE node")
+    assert orphans["uuids"] == ["me", "ozon"]
+
+
+@pytest.mark.asyncio
+async def test_a_selected_prose_summary_is_forgotten_whole() -> None:
+    driver = ForgettingDriver()
+    graphiti = FakeGraphiti()
+    graphiti.driver = driver  # type: ignore[assignment]
+
+    forgotten = await memory(graphiti).forget(
+        namespace="user_abc", refs=["node:yandex"]
+    )
+
+    assert "Пользователь работает в Яндексе" in forgotten
+    assert [query["uuid"] for query in driver.matching("SET node.summary")] == [
+        "yandex"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forgetting_reports_backend_failures_as_controlled_errors() -> None:
+    graphiti = FakeGraphiti()
+    graphiti.driver = SimpleNamespace(
+        execute_query=AsyncMock(side_effect=RuntimeError("neo4j down"))
+    )
+
+    with pytest.raises(KnowledgeMemoryError):
+        await memory(graphiti).forget(namespace="user_abc", refs=["edge:1"])
+
+
+@pytest.mark.asyncio
+async def test_service_forgets_within_the_user_namespace() -> None:
+    backend = SimpleNamespace(forget=AsyncMock(return_value=["Работает в Ozon"]))
+    knowledge = KnowledgeService(memory=backend)
+
+    assert await knowledge.forget(user_id=42, refs=["edge:1"]) == ["Работает в Ozon"]
+    assert awaited_kwargs(backend.forget)["namespace"] == namespace_for(42)
+
+    backend.forget.reset_mock()
+    assert await knowledge.forget(user_id=42, refs=[]) == []
+    backend.forget.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forgetting_lets_the_model_pick_only_recalled_refs() -> None:
+    candidates = [
+        KnowledgeFact(fact="Пользователь работает в Ozon", ref="edge:ozon"),
+        KnowledgeFact(fact="Пользователь работает в Яндексе", ref="edge:yandex"),
+    ]
+    knowledge = service(forget_candidates=AsyncMock(return_value=candidates))
+    process, llm, executed = use_case(
+        decisions=[
+            forgetting(),
+            forgetting("работает в Ozon", "edge:ozon", "edge:someone-else"),
+        ],
+        knowledge=knowledge,
+    )
+
+    await process.execute(
+        text="Забудь, что я работаю в Ozon",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    shown = awaited_kwargs(llm.parse_message)["knowledge"]
+    assert "edge:yandex" in shown and "edge:ozon" in shown
+    # A ref the recall never produced cannot reach the executor.
+    assert (
+        executed.execute_many.await_args.args[0]
+        == forgetting("работает в Ozon", "edge:ozon").actions
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_picks_something_else", [False, True])
+async def test_forgetting_nothing_matching_erases_nothing(
+    model_picks_something_else: bool,
+) -> None:
+    found = (
+        [KnowledgeFact(fact="Пользователь работает в Яндексе", ref="edge:y")]
+        if model_picks_something_else
+        else []
+    )
+    knowledge = service(forget_candidates=AsyncMock(return_value=found))
+    process, llm, executed = use_case(
+        decisions=[forgetting(), forgetting()], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Забудь, что я работаю в Ozon",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == (2 if model_picks_something_else else 1)
+    assert executed.execute_many.await_args.args[0] == [
+        ChatAction(type=ActionType.CHAT, text="В памяти этого нет — забывать нечего.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forgetting_degrades_when_memory_is_down() -> None:
+    knowledge = service(
+        forget_candidates=AsyncMock(side_effect=KnowledgeMemoryError("down"))
+    )
+    process, _, executed = use_case(decisions=[forgetting()], knowledge=knowledge)
+
+    await process.execute(
+        text="Забудь Ozon", now=NOW, timezone="Europe/Moscow", user_id=42
+    )
+
+    assert executed.execute_many.await_args.args[0] == [
+        ChatAction(type=ActionType.CHAT, text=MEMORY_UNAVAILABLE)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forget_tool_reports_what_it_erased() -> None:
+    erase = AsyncMock(side_effect=[["Пользователь работает в Ozon"], []])
+    tool = executor(knowledge=service(forget=erase))
+    action = forgetting("работает в Ozon", "edge:ozon").actions[0]
+
+    assert await tool.execute(action, user_id=42, now=NOW) == (
+        "🧹 Забыл:\n• Пользователь работает в Ozon"
+    )
+    assert awaited_kwargs(erase)["namespace"] == namespace_for(42)
+    assert await tool.execute(action, user_id=42, now=NOW) == (
+        "В памяти этого нет — забывать нечего."
+    )
+    disabled = await executor(knowledge=None).execute(action, user_id=42, now=NOW)
+    assert "отключена" in str(disabled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_picks", [("edge:yandex",), ()])
+async def test_forgetting_never_drops_the_fact_stated_alongside(
+    model_picks: tuple[str, ...],
+) -> None:
+    """«Уволился из Яндекса, теперь в Ozon» came as forget + remember.
+
+    Resolving the forget returned only the forget, the Ozon fact was never
+    stored, and the next «Где я работаю?» found nothing (eval, 2026-09-14).
+    """
+    remember = RememberKnowledgeAction(
+        type=ActionType.REMEMBER_KNOWLEDGE, content="Пользователь работает в Ozon"
+    )
+    first = AssistantDecision(
+        actions=[*forgetting("работает в Яндексе").actions, remember]
+    )
+    knowledge = service(
+        forget_candidates=AsyncMock(
+            return_value=[
+                KnowledgeFact(fact="Пользователь работает в Яндексе", ref="edge:yandex")
+            ]
+        )
+    )
+    process, _, executed = use_case(
+        decisions=[first, forgetting("работает в Яндексе", *model_picks)],
+        knowledge=knowledge,
+    )
+
+    await process.execute(
+        text="Я уволился из Яндекса и теперь работаю в Ozon",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    expected = (
+        [*forgetting("работает в Яндексе", *model_picks).actions, remember]
+        if model_picks
+        else [remember]
+    )
+    assert executed.execute_many.await_args.args[0] == expected
+
+
+@pytest.mark.asyncio
+async def test_an_admitted_ignorance_triggers_the_search_the_model_skipped() -> None:
+    """«Я пока не знаю, куда мы ездили» came with the trip stored (eval, 2026-09-14)."""
+    trip = [KnowledgeFact(fact="Пользователь ездил в Выборг с Машей в субботу")]
+    search = AsyncMock(return_value=trip)
+    knowledge = service(search=search)
+    process, llm, executed = use_case(
+        decisions=[
+            chat(
+                "Я пока не знаю, куда мы ездили на выходных. Расскажите, и я запомню."
+            ),
+            chat("В Выборг."),
+        ],
+        knowledge=knowledge,
+    )
+
+    await process.execute(
+        text="Куда мы ездили на выходных?",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert awaited_kwargs(search)["query"] == "Куда мы ездили на выходных?"
+    assert "Выборг" in awaited_kwargs(llm.parse_message)["knowledge"]
+    assert executed.execute_many.await_args.args[0] == chat("В Выборг.").actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "configured"),
+    [("51", True), ("Не знаю, ты не говорил.", False)],
+)
+async def test_a_confident_chat_or_a_memoryless_bot_is_left_alone(
+    reply: str, configured: bool
+) -> None:
+    knowledge = service(search=AsyncMock(return_value=[])) if configured else None
+    process, llm, executed = use_case(decisions=[chat(reply)], knowledge=knowledge)
+
+    await process.execute(
+        text="Сколько будет 17 умножить на 3?",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert llm.parse_message.await_count == 1
+    assert executed.execute_many.await_args.args[0] == chat(reply).actions
+
+
+@pytest.mark.asyncio
+async def test_an_empty_candidate_list_answers_instead_of_failing_validation() -> None:
+    """A model slip must not cost the whole reply (memory eval, 2026-09-17)."""
+    decision = AssistantDecision.model_validate(
+        {"actions": [{"type": "recommend_films", "candidates": [], "limit": 10}]}
+    )
+    knowledge = service(watched_film_titles=AsyncMock(return_value=["Начало"]))
+
+    reply = await executor(knowledge=knowledge).execute(
+        decision.actions[0], user_id=42, now=NOW
+    )
+
+    assert isinstance(reply, str) and "уже всё смотрел" in reply
+
+
+def _numbered(*items: str) -> str:
+    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, start=1))
+
+
+@pytest.mark.asyncio
+async def test_a_long_list_is_reviewed_against_the_recalled_facts() -> None:
+    """The model wrote «Рамен с грибами (без грибов)» whatever the prompt said."""
+    knowledge = service(
+        search=AsyncMock(return_value=[KnowledgeFact(fact="Не любит грибы")])
+    )
+    draft = _numbered("Рамен с грибами", "Том ям", "Удон", "Гёдза", "Рис")
+    fixed = _numbered("Рамен с тофу", "Том ям", "Удон", "Гёдза", "Рис")
+    process, llm, executed = use_case(
+        decisions=[searching(), chat(draft), chat(fixed)], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Предложи 5 блюд без того, что я не люблю",
+        now=NOW,
+        timezone="Europe/Moscow",
+        user_id=42,
+    )
+
+    assert executed.execute_many.await_args.args[0] == chat(fixed).actions
+    # Decision, answer, review — the draft is never sent to the user.
+    assert llm.parse_message.await_count == 3
+    reviewed = awaited_kwargs(llm.parse_message)["text"]
+    assert draft in reviewed and "черновик" in reviewed
+
+
+@pytest.mark.asyncio
+async def test_a_review_that_shortens_the_list_is_discarded() -> None:
+    knowledge = service(search=AsyncMock(return_value=[KnowledgeFact(fact="Факт")]))
+    draft = _numbered("Раз", "Два", "Три", "Четыре", "Пять")
+    process, llm, executed = use_case(
+        decisions=[searching(), chat(draft), chat(_numbered("Раз", "Два"))],
+        knowledge=knowledge,
+    )
+
+    await process.execute(
+        text="Назови 5 идей", now=NOW, timezone="Europe/Moscow", user_id=42
+    )
+
+    assert executed.execute_many.await_args.args[0] == chat(draft).actions
+
+
+@pytest.mark.asyncio
+async def test_a_short_answer_is_not_reviewed() -> None:
+    knowledge = service(search=AsyncMock(return_value=[KnowledgeFact(fact="Джек")]))
+    process, llm, executed = use_case(
+        decisions=[searching(), chat("Твою собаку зовут Джек.")], knowledge=knowledge
+    )
+
+    await process.execute(
+        text="Как зовут мою собаку?", now=NOW, timezone="Europe/Moscow", user_id=42
+    )
+
+    assert llm.parse_message.await_count == 2
+    assert (
+        executed.execute_many.await_args.args[0]
+        == chat("Твою собаку зовут Джек.").actions
+    )

@@ -62,9 +62,7 @@ def dependencies(
         delete_event=AsyncMock(),
         disconnect=AsyncMock(),
     )
-    pending = SimpleNamespace(
-        consume_latest_operation=AsyncMock(return_value=operation),
-    )
+    pending = SimpleNamespace()
     task_tracker = SimpleNamespace(
         create_task=AsyncMock(
             return_value=CreatedTask(
@@ -104,7 +102,6 @@ async def test_execute_many_creates_all_tasks_in_source_order() -> None:
         call(title="Отдохнуть"),
     ]
     calendar.create_event.assert_not_awaited()
-    pending.consume_latest_operation.assert_not_awaited()
     assert result == (
         "✅ Создана задача ENG-1: Посмотреть фильм\nurl-1\n\n"
         "✅ Создана задача ENG-2: Поботать LLM-ки\nurl-2\n\n"
@@ -248,7 +245,6 @@ async def test_non_calendar_actions_return_expected_response(
     calendar.list_events.assert_not_awaited()
     calendar.update_event.assert_not_awaited()
     calendar.delete_event.assert_not_awaited()
-    pending.consume_latest_operation.assert_not_awaited()
     task_tracker.create_task.assert_not_awaited()
 
 
@@ -264,7 +260,6 @@ async def test_create_task_calls_linear_and_returns_link() -> None:
 
     task_tracker.create_task.assert_awaited_once_with(title="Купить продукты")
     calendar.create_event.assert_not_awaited()
-    pending.consume_latest_operation.assert_not_awaited()
     assert result == (
         "✅ Создана задача ENG-42: Купить продукты\n"
         "https://linear.app/acme/issue/ENG-42/buy-groceries"
@@ -386,7 +381,6 @@ async def test_update_event_uses_the_single_match_found_by_title() -> None:
     result = await executor.execute(update_action(), user_id=42, now=NOW)
 
     calendar.find_events.assert_awaited_once_with(user_id=42, title="стоматолог")
-    pending.consume_latest_operation.assert_not_awaited()
     calendar.update_event.assert_awaited_once_with(
         user_id=42,
         event_id="event-1",

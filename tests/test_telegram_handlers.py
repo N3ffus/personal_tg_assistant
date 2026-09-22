@@ -190,6 +190,8 @@ class FakeMessage:
     ) -> None:
         self.from_user = SimpleNamespace(id=user_id) if user_id is not None else None
         self.text = text
+        # A message delivered outside a dispatcher has no bound bot.
+        self.bot = None
         self.answers: list[tuple[str, dict[str, Any]]] = []
 
     async def answer(self, text: str, **kwargs: Any) -> None:

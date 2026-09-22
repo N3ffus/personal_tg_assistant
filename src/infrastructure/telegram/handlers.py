@@ -15,7 +15,12 @@ from src.application.use_cases.process_message import (
 )
 from src.domain.assistant.replies import ResultPage
 from src.domain.assistant.retrieval import RetrievalLimitError
-from src.infrastructure.telegram.replies import answer_page, answer_reply, answer_text
+from src.infrastructure.telegram.replies import (
+    answer_page,
+    answer_reply,
+    answer_text,
+    typing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,17 +172,18 @@ def create_router(
                 ZoneInfo(timezone),
             )
 
-            response = await process_message.execute(
-                text=text,
-                now=now,
-                timezone=timezone,
-                user_id=message.from_user.id,
-                **(
-                    {"chat_id": message.chat.id, "message_id": message.message_id}
-                    if contexts is not None
-                    else {}
-                ),
-            )
+            async with typing(message):
+                response = await process_message.execute(
+                    text=text,
+                    now=now,
+                    timezone=timezone,
+                    user_id=message.from_user.id,
+                    **(
+                        {"chat_id": message.chat.id, "message_id": message.message_id}
+                        if contexts is not None
+                        else {}
+                    ),
+                )
 
         except TaskCreationUncertainError:
             logger.exception(

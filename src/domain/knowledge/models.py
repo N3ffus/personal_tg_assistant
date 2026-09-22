@@ -8,6 +8,9 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 KnowledgeText = Annotated[str, Field(min_length=1, max_length=4000)]
 MAX_KNOWLEDGE_RESULTS = 20
 DEFAULT_KNOWLEDGE_RESULTS = 5
+# Everything the user said, newest kept: the production owner has ~180 such
+# statements of ~150 characters, far below what the answer turn can read.
+MAX_PROFILE_FACTS = 300
 
 # A fixed seed keeps the derived namespace stable across restarts while keeping
 # raw Telegram identifiers out of the knowledge graph.
@@ -68,12 +71,22 @@ class KnowledgeFact(KnowledgeModel):
     fact: str
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+    # When the user said it. Graphiti keeps the superseded edge's valid_at
+    # when a fact is updated («живёт в Леснограде» inherited the date of
+    # «живёт в Янтарске»), so the statement time is what orders versions.
+    stated_at: datetime | None = None
     source: str | None = None
+    # The graph element holding the fact; set only when the fact may be forgotten.
+    ref: str | None = None
 
     def as_payload(self) -> dict[str, str | None]:
-        return {
+        payload = {
             "fact": self.fact,
             "valid_from": self.valid_from.isoformat() if self.valid_from else None,
             "valid_until": self.valid_until.isoformat() if self.valid_until else None,
+            "stated_at": self.stated_at.isoformat() if self.stated_at else None,
             "source": self.source,
         }
+        if self.ref is not None:
+            payload["ref"] = self.ref
+        return payload

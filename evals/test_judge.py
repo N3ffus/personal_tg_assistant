@@ -18,7 +18,8 @@ from deepeval.metrics import GEval, ToolCorrectnessMetric
 from deepeval.test_case import LLMTestCase, SingleTurnParams, ToolCall
 
 from evals.judge import DeepInfraJudge
-from evals.settings import DEEPINFRA_BASE_URL, JUDGE_MODEL, EvalSettings
+from evals.settings import JUDGE_MODEL, EvalSettings
+from src.config import DEEPINFRA_BASE_URL
 
 
 class Verdict(BaseModel):

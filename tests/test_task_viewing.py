@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -18,7 +18,6 @@ from src.domain.assistant.replies import AssistantReply
 from src.domain.assistant.retrieval import EventQuery, TaskQuery
 from src.domain.calendar.models import CalendarEvent
 from src.domain.tasks.models import Task
-from src.infrastructure.telegram.calendar import _event_keyboard
 from src.infrastructure.telegram.commands import BOT_COMMANDS, configure_commands
 from src.infrastructure.telegram.handlers import create_router
 from src.infrastructure.telegram.replies import answer_text
@@ -291,39 +290,6 @@ async def test_menu_includes_all_commands_and_is_synchronized() -> None:
     bot.set_chat_menu_button.assert_awaited_once()
 
 
-def test_event_display_normalizes_timed_events_but_preserves_all_day_dates() -> None:
-    all_day = CalendarEvent(
-        event_id="holiday",
-        title="Отпуск",
-        starts_at=datetime(2026, 9, 6, tzinfo=UTC),
-        ends_at=datetime(2026, 9, 9, tzinfo=UTC),
-        html_link=None,
-        all_day=True,
-    )
-    text = ActionExecutor.format_events(
-        [EVENT, all_day], timezone=ZoneInfo("America/Los_Angeles")
-    )
-    assert "06.09.2026 02:00 PDT" in text
-    assert "06.09.2026–08.09.2026 (весь день)" in text
-    single_day = CalendarEvent(
-        event_id="holiday-2",
-        title="Праздник",
-        starts_at=all_day.starts_at,
-        ends_at=all_day.starts_at + timedelta(days=1),
-        html_link=None,
-        all_day=True,
-    )
-    assert "06.09.2026 (весь день)" in ActionExecutor.format_events([single_day])
-    keyboard = _event_keyboard([EVENT, all_day], ["timed-token", "date-token"])
-    assert [b.callback_data for b in keyboard.inline_keyboard[0]] == [
-        "caledit:timed-token",
-        "caldel:timed-token",
-    ]
-    assert [b.callback_data for b in keyboard.inline_keyboard[1]] == [
-        "caldel:date-token"
-    ]
-
-
 @pytest.mark.asyncio
 async def test_long_task_list_is_split_without_losing_tasks() -> None:
     tasks = [
@@ -335,7 +301,10 @@ async def test_long_task_list_is_split_without_losing_tasks() -> None:
         )
         for i in range(101)
     ]
-    text = ActionExecutor.format_tasks(tasks)
+    text = "\n".join(
+        f"• {task.identifier}: {task.title} — {task.status}\n{task.url}"
+        for task in tasks
+    )
     message = AsyncMock(spec=Message)
     message.answer = AsyncMock()
     await answer_text(message, text)

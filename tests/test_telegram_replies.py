@@ -4,7 +4,12 @@ import pytest
 from aiogram.types import InlineKeyboardMarkup, Message
 
 from src.domain.assistant.replies import AssistantReply, Confirmation
-from src.infrastructure.telegram.replies import answer_reply, answer_text, split_text
+from src.infrastructure.telegram.replies import (
+    answer_reply,
+    answer_text,
+    split_text,
+    typing,
+)
 
 
 class FakeMessage:
@@ -78,3 +83,57 @@ async def test_answer_text_attaches_keyboard_only_to_final_chunk() -> None:
         ("a" * 4096, {}),
         ("a", {"reply_markup": keyboard}),
     ]
+
+
+class TypingBot:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.actions: list[tuple[int, str]] = []
+        self.fail = fail
+
+    async def send_chat_action(self, *, chat_id: int, action: str) -> None:
+        self.actions.append((chat_id, action))
+        if self.fail:
+            from aiogram.exceptions import TelegramNetworkError
+            from aiogram.methods import SendChatAction
+
+            raise TelegramNetworkError(
+                method=SendChatAction(chat_id=chat_id, action=action),
+                message="timeout",
+            )
+
+
+def typing_message(bot: object | None) -> Message:
+    from types import SimpleNamespace
+
+    return cast(Message, SimpleNamespace(bot=bot, chat=SimpleNamespace(id=7)))
+
+
+@pytest.mark.asyncio
+async def test_typing_is_shown_while_the_reply_is_prepared() -> None:
+    """A 49 s turn in silence reads as a lost message."""
+    import asyncio
+
+    bot = TypingBot()
+    async with typing(typing_message(bot)):
+        await asyncio.sleep(0)
+
+    assert bot.actions == [(7, "typing")]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_typing_indicator_never_reaches_the_reply() -> None:
+    import asyncio
+
+    bot = TypingBot(fail=True)
+    async with typing(typing_message(bot)):
+        await asyncio.sleep(0)
+        result = "ответ"
+
+    assert result == "ответ"
+    assert bot.actions == [(7, "typing")]
+
+
+@pytest.mark.asyncio
+async def test_typing_without_a_bound_bot_is_a_no_op() -> None:
+    async with typing(typing_message(None)):
+        pass

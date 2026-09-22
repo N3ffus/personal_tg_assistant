@@ -1,7 +1,8 @@
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+from src.config import DEEPINFRA_BASE_URL, DEFAULT_LLM_MODEL
+
 JUDGE_MODEL = "zai-org/GLM-5.3-Flash"
 
 
@@ -15,8 +16,8 @@ class EvalSettings(BaseSettings):
     deepinfra_api_key: SecretStr
     eval_judge_model: str = JUDGE_MODEL
     llm_api_key: SecretStr
-    llm_base_url: str = "https://api.gonkagate.com/v1"
-    llm_model: str = "gpt-5.6"
+    llm_base_url: str = DEEPINFRA_BASE_URL
+    llm_model: str = DEFAULT_LLM_MODEL
     eval_timeout_seconds: float = Field(default=90, gt=0, le=300)
 
     @field_validator("deepinfra_api_key", "llm_api_key")

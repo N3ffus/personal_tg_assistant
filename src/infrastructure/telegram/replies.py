@@ -1,3 +1,11 @@
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from typing import Any
+
+from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -6,8 +14,45 @@ from aiogram.types import (
 )
 
 from src.domain.assistant.replies import AssistantReply, ResultPage
+from src.infrastructure.telegram.markdown import FENCE, markdown_to_html
+
+logger = logging.getLogger(__name__)
 
 TELEGRAM_TEXT_LIMIT = 4096
+# Telegram clears «печатает…» after five seconds, so it is renewed sooner.
+TYPING_RENEWAL_SECONDS = 4
+
+
+@asynccontextmanager
+async def typing(message: Message) -> AsyncIterator[None]:
+    """Show «печатает…» while a reply is being prepared.
+
+    A turn can take tens of seconds (a 49 s one on production), and silence
+    reads as a lost message. The indicator is cosmetic: a failure to send it
+    is logged and never reaches the reply.
+    """
+    bot = message.bot
+    if bot is None:
+        yield
+        return
+
+    async def keep_typing() -> None:
+        while True:
+            try:
+                await bot.send_chat_action(
+                    chat_id=message.chat.id, action=ChatAction.TYPING
+                )
+            except TelegramAPIError:
+                logger.debug("Could not send the typing indicator")
+            await asyncio.sleep(TYPING_RENEWAL_SECONDS)
+
+    indicator = asyncio.create_task(keep_typing(), name="telegram-typing")
+    try:
+        yield
+    finally:
+        indicator.cancel()
+        with suppress(asyncio.CancelledError):
+            await indicator
 
 
 async def answer_reply(message: Message, reply: str | AssistantReply) -> None:
@@ -69,13 +114,41 @@ async def answer_text(
     *,
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    chunks = split_text(text)
+    chunks = _reopen_code_fences(split_text(text))
     for chunk in chunks[:-1]:
-        await message.answer(chunk)
+        await _answer_markdown(message, chunk)
     if reply_markup is None:
-        await message.answer(chunks[-1])
+        await _answer_markdown(message, chunks[-1])
     else:
-        await message.answer(chunks[-1], reply_markup=reply_markup)
+        await _answer_markdown(message, chunks[-1], reply_markup=reply_markup)
+
+
+async def _answer_markdown(message: Message, text: str, **kwargs: Any) -> None:
+    html = markdown_to_html(text)
+    if html == text:
+        await message.answer(text, **kwargs)
+        return
+    try:
+        await message.answer(html, parse_mode="HTML", **kwargs)
+    except TelegramBadRequest as error:
+        # The reply must still arrive, even without its formatting.
+        if "can't parse entities" not in error.message.lower():
+            raise
+        logger.warning("telegram.markdown.rejected")
+        await message.answer(text, **kwargs)
+
+
+def _reopen_code_fences(chunks: list[str]) -> list[str]:
+    # A code block cut between two messages is closed and reopened across the cut.
+    result: list[str] = []
+    carried = False
+    for chunk in chunks:
+        if carried:
+            chunk = "```\n" + chunk
+        fences = sum(1 for line in chunk.split("\n") if FENCE.match(line))
+        carried = fences % 2 == 1
+        result.append(chunk + "\n```" if carried else chunk)
+    return result
 
 
 def split_text(text: str, *, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:

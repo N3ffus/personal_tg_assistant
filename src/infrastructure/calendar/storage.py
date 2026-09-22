@@ -187,28 +187,6 @@ class CalendarStorage:
             return None
         return str(row[0]), json.loads(row[1])
 
-    async def consume_latest_operation(
-        self, *, user_id: int, kind: str
-    ) -> dict[str, object] | None:
-        async with connect(self._database_path) as database:
-            cursor = await database.execute(
-                """DELETE FROM pending_operations
-                WHERE operation_id = (
-                    SELECT operation_id FROM pending_operations
-                    WHERE telegram_user_id = ? AND kind = ?
-                    ORDER BY rowid DESC LIMIT 1
-                ) AND telegram_user_id = ?
-                RETURNING payload, expires_at""",
-                (user_id, kind, user_id),
-            )
-            row = await cursor.fetchone()
-            await database.commit()
-        if row is None:
-            return None
-        if datetime.fromisoformat(row[1]) <= datetime.now(UTC):
-            return None
-        return cast(dict[str, object], json.loads(row[0]))
-
     @staticmethod
     def _expires_in(*, minutes: int) -> str:
         return (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()

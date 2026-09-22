@@ -79,5 +79,6 @@ testpaths = ["tests", "evals"]
 addopts = "-p no:deepeval --strict-markers -m 'not integration'"
 markers = [
     "llm_eval: paid, live LLM calls; requires --run-llm-evals",
+    "memory_eval: live long-term memory evals; need Neo4j, run with make eval-memory",
     "integration: live Neo4j and LLM provider; run with make test-integration",
 ]

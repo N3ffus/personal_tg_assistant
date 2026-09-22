@@ -20,8 +20,7 @@ from src.domain.assistant.context import (
 from src.domain.assistant.models import AssistantDecision
 from src.domain.assistant.replies import AssistantReply, Confirmation
 from src.infrastructure.context.storage import ContextStorage
-from src.infrastructure.llm.gonkagate import GonkaGateLLMClient
-from src.infrastructure.llm.openai import OpenAILLMClient
+from src.infrastructure.llm.client import ChatLLMClient
 
 NOW = datetime(2026, 9, 5, 12, tzinfo=UTC)
 
@@ -312,11 +311,8 @@ async def test_bot_passes_only_own_context_and_actual_replies_in_order(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("client_class", [OpenAILLMClient, GonkaGateLLMClient])
-async def test_llm_receives_history_as_data_and_uses_separate_summary_prompt(
-    client_class: type[OpenAILLMClient] | type[GonkaGateLLMClient],
-) -> None:
-    client = client_class(
+async def test_llm_receives_history_as_data_and_uses_separate_summary_prompt() -> None:
+    client = ChatLLMClient(
         api_key="test", base_url="https://example.test/v1", model="test"
     )
     decision = AssistantDecision.model_validate(
@@ -324,7 +320,6 @@ async def test_llm_receives_history_as_data_and_uses_separate_summary_prompt(
     )
     parse = AsyncMock(
         return_value=SimpleNamespace(
-            output_parsed=decision,
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(content=decision.model_dump_json())
@@ -334,32 +329,25 @@ async def test_llm_receives_history_as_data_and_uses_separate_summary_prompt(
     )
     summary = AsyncMock(
         return_value=SimpleNamespace(
-            output_text="Резюме",
             choices=[SimpleNamespace(message=SimpleNamespace(content="Резюме"))],
         )
     )
-    if isinstance(client, OpenAILLMClient):
-        client._client.responses.parse = parse  # type: ignore[method-assign]
-        client._client.responses.create = summary  # type: ignore[method-assign]
-    else:
-        client._client.chat.completions.create = parse  # type: ignore[method-assign]
+    client._client.chat.completions.create = parse  # type: ignore[method-assign]
     await client.parse_message(
         text="А когда?", now=NOW, timezone="UTC", context='Ранее: "встреча завтра"'
     )
-    payload = (
-        parse.call_args.kwargs.get("input")
-        or parse.call_args.kwargs["messages"][1]["content"]
-    )
+    payload = parse.call_args.kwargs["messages"][1]["content"]
     assert json.loads(payload) == {
         "current_message": "А когда?",
         "previous_conversation": 'Ранее: "встреча завтра"',
     }
-    if isinstance(client, GonkaGateLLMClient):
-        client._client.chat.completions.create = summary  # type: ignore[method-assign]
+    client._client.chat.completions.create = summary  # type: ignore[method-assign]
     assert await client.summarize(text="История") == "Резюме"
     assert "История" in str(summary.call_args)
     assert "не выполняй" in str(summary.call_args)
-    summary.return_value = SimpleNamespace(output_text="", choices=[])
+    summary.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=""))]
+    )
     with pytest.raises(RuntimeError, match="empty summary"):
         await client.summarize(text="История")
     await client.close()

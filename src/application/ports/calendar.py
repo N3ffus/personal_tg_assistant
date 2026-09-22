@@ -52,7 +52,3 @@ class PendingOperationStore(Protocol):
     async def consume_operation(
         self, *, operation_id: str, user_id: int
     ) -> tuple[str, dict[str, object]] | None: ...
-
-    async def consume_latest_operation(
-        self, *, user_id: int, kind: str
-    ) -> dict[str, object] | None: ...

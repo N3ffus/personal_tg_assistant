@@ -1,22 +1,45 @@
+import asyncio
 import logging
+from collections import OrderedDict
 from datetime import UTC, datetime
 from itertools import zip_longest
+from time import monotonic, perf_counter
 from typing import Any
 
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType, EpisodicNode
-from graphiti_core.search.search_config import SearchConfig
+from graphiti_core.search.search import search as graphiti_search
+from graphiti_core.search.search_config import (
+    EdgeSearchMethod,
+    NodeSearchMethod,
+    SearchConfig,
+)
 from graphiti_core.search.search_config_recipes import (
     COMBINED_HYBRID_SEARCH_RRF,
     EDGE_HYBRID_SEARCH_RRF,
     NODE_HYBRID_SEARCH_RRF,
 )
+from graphiti_core.search.search_filters import SearchFilters
 
 from src.application.ports.knowledge import KnowledgeMemoryError
 from src.domain.knowledge.models import (
     KnowledgeEpisode,
     KnowledgeFact,
     KnowledgeSourceType,
+)
+from src.infrastructure.knowledge.cypher import (
+    DROP_ORPHANS,
+    EPISODE_SIMILARITY,
+    FORGET_EDGES,
+    FORGET_EPISODES,
+    PROFILE_EPISODES,
+    READ_EDGE_FACTS,
+    READ_EPISODE_CONTENTS,
+    READ_SUMMARIES,
+    RECENT_WATCHED_FILMS,
+    SET_EPISODE_EMBEDDING,
+    SET_SUMMARY,
+    WATCHED_FILM_CONTENTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,22 +60,16 @@ SEARCH_CONFIG = SearchConfig(
     episode_config=COMBINED_HYBRID_SEARCH_RRF.episode_config,
 )
 
-# A date never becomes an entity, so an edge like HAS_DATE_OF_BIRTH loses its
-# target and is dropped: "родился 02.05.2003" can only survive in the episode.
-# Episode search is BM25 — "дата рождения" does not match "родился" — so the
-# adapter embeds every episode itself and recalls it by meaning.
-EPISODE_SIMILARITY = """
-MATCH (episode:Episodic {group_id: $namespace})
-WHERE episode.content_embedding IS NOT NULL
-WITH episode,
-     vector.similarity.cosine(episode.content_embedding, $embedding) AS score
-WHERE score >= $min_score
-RETURN episode.name AS name, episode.content AS content,
-       episode.valid_at AS valid_at
-ORDER BY score DESC LIMIT $limit
-"""
 # Unrelated Russian sentences sit well below this; paraphrases sit above it.
 MIN_EPISODE_SIMILARITY = 0.5
+QUERY_EMBEDDING_CACHE_SIZE = 128
+QUERY_EMBEDDING_TTL_SECONDS = 300
+
+# Handles the model gets for facts it may ask to forget. Every erasing query
+# still matches the namespace, so a ref from another user erases nothing.
+EDGE_REF = "edge:"
+NODE_REF = "node:"
+EPISODE_REF = "episode:"
 
 EPISODE_TYPES: dict[KnowledgeSourceType, EpisodeType] = {
     # Conversational material keeps speaker attribution; notes are plain text.
@@ -67,6 +84,11 @@ class GraphitiKnowledgeMemory:
 
     def __init__(self, *, graphiti: Graphiti) -> None:
         self._graphiti = graphiti
+        # Cache vectors only. Facts are always read afresh, including after writes
+        # or imports, and every graph query still carries the user's namespace.
+        self._query_embeddings: OrderedDict[str, tuple[float, list[float]]] = (
+            OrderedDict()
+        )
 
     async def initialize(self) -> None:
         """Create Graphiti indices; safe to repeat on every start."""
@@ -107,8 +129,7 @@ class GraphitiKnowledgeMemory:
         try:
             embedding = await self._graphiti.embedder.create(input_data=content)
             await self._graphiti.driver.execute_query(
-                "MATCH (episode:Episodic {uuid: $uuid}) "
-                "SET episode.content_embedding = $embedding",
+                SET_EPISODE_EMBEDDING,
                 uuid=uuid,
                 embedding=embedding,
             )
@@ -120,11 +141,95 @@ class GraphitiKnowledgeMemory:
     async def search(
         self, *, namespace: str, query: str, limit: int
     ) -> list[KnowledgeFact]:
+        facts = await self.forget_candidates(
+            namespace=namespace, query=query, limit=limit
+        )
+        # A ref is a handle for erasing; an ordinary answer has no use for it.
+        return [fact.model_copy(update={"ref": None}) for fact in facts]
+
+    async def forget_candidates(
+        self, *, namespace: str, query: str, limit: int
+    ) -> list[KnowledgeFact]:
+        if not query.strip():
+            return []
+        started = perf_counter()
+        embedding = await self._query_embedding(query)
+        embedded = perf_counter()
         try:
-            results = await self._graphiti.search_(
+            layers, similar = await asyncio.gather(
+                self._search_layers(
+                    namespace=namespace, query=query, limit=limit, embedding=embedding
+                ),
+                self._similar_episodes(
+                    namespace=namespace, embedding=embedding, limit=limit
+                ),
+                return_exceptions=True,
+            )
+            # Both reads have finished before an error can escape. Cancellation
+            # of the caller also cancels gather's children.
+            if isinstance(layers, BaseException):
+                raise layers
+            if isinstance(similar, BaseException):
+                raise similar
+        except Exception as error:
+            raise KnowledgeMemoryError(_reason(error)) from error
+        seen = {fact.fact for layer in layers for fact in layer}
+        unique_similar = []
+        for fact in similar:
+            if fact.fact not in seen:
+                seen.add(fact.fact)
+                unique_similar.append(fact)
+        logger.info(
+            "knowledge.search.timing embedding_ms=%.0f retrieval_ms=%.0f",
+            (embedded - started) * 1000,
+            (perf_counter() - embedded) * 1000,
+        )
+        return _interleaved(*layers, unique_similar)[:limit]
+
+    async def _query_embedding(self, query: str) -> list[float] | None:
+        query = query.replace("\n", " ").strip()
+        cached = self._query_embeddings.get(query)
+        if cached is not None and monotonic() - cached[0] < QUERY_EMBEDDING_TTL_SECONDS:
+            self._query_embeddings.move_to_end(query)
+            return cached[1]
+        try:
+            embedding = await self._graphiti.embedder.create(input_data=query)
+        except Exception as error:
+            logger.warning("knowledge.embed.failed query reason=%s", _reason(error))
+            return None
+        self._query_embeddings[query] = (monotonic(), embedding)
+        self._query_embeddings.move_to_end(query)
+        while len(self._query_embeddings) > QUERY_EMBEDDING_CACHE_SIZE:
+            self._query_embeddings.popitem(last=False)
+        return embedding
+
+    async def _search_layers(
+        self,
+        *,
+        namespace: str,
+        query: str,
+        limit: int,
+        embedding: list[float] | None,
+    ) -> tuple[list[KnowledgeFact], list[KnowledgeFact], list[KnowledgeFact]]:
+        config = SEARCH_CONFIG.model_copy(deep=True, update={"limit": limit})
+        if embedding is None:
+            # A failed embedder must not retry inside Graphiti and lose keyword
+            # results. Keep all three layers, using BM25 on this request only.
+            if config.edge_config is not None:
+                config.edge_config.search_methods = [EdgeSearchMethod.bm25]
+            if config.node_config is not None:
+                config.node_config.search_methods = [NodeSearchMethod.bm25]
+        try:
+            # Graphiti.search_ doesn't expose query_vector; its underlying search
+            # does. Share this request's vector with the episode similarity query.
+            results = await graphiti_search(
+                clients=self._graphiti.clients,
                 query=query,
                 group_ids=[namespace],
-                config=SEARCH_CONFIG.model_copy(update={"limit": limit}),
+                config=config,
+                search_filter=SearchFilters(),
+                query_vector=embedding,
+                driver=self._graphiti.driver,
             )
             # Defence in depth: never surface a result from another namespace.
             edges = [edge for edge in results.edges if edge.group_id == namespace]
@@ -132,7 +237,7 @@ class GraphitiKnowledgeMemory:
             episodes = [
                 episode for episode in results.episodes if episode.group_id == namespace
             ]
-            sources = await self._episode_names(
+            sources = await self._episode_sources(
                 namespace=namespace,
                 uuids=[uuid for edge in edges for uuid in edge.episodes],
             )
@@ -143,9 +248,12 @@ class GraphitiKnowledgeMemory:
                 fact=edge.fact,
                 valid_from=edge.valid_at,
                 valid_until=edge.invalid_at,
+                stated_at=_latest(sources, edge.episodes),
                 source=next(
-                    (sources[uuid] for uuid in edge.episodes if uuid in sources), None
+                    (sources[uuid][0] for uuid in edge.episodes if uuid in sources),
+                    None,
                 ),
+                ref=f"{EDGE_REF}{edge.uuid}",
             )
             for edge in edges
         ]
@@ -159,7 +267,7 @@ class GraphitiKnowledgeMemory:
             if not text or text in seen:
                 continue
             seen.add(text)
-            node_facts.append(KnowledgeFact(fact=text))
+            node_facts.append(KnowledgeFact(fact=text, ref=f"{NODE_REF}{node.uuid}"))
         episode_facts: list[KnowledgeFact] = []
         for episode in episodes:
             text = _without_speaker(episode.content)
@@ -168,20 +276,22 @@ class GraphitiKnowledgeMemory:
             seen.add(text)
             episode_facts.append(
                 KnowledgeFact(
-                    fact=text, valid_from=episode.valid_at, source=episode.name
+                    fact=text,
+                    valid_from=episode.valid_at,
+                    stated_at=episode.valid_at,
+                    source=episode.name,
+                    ref=f"{EPISODE_REF}{episode.uuid}",
                 )
             )
-        similar = await self._similar_episodes(
-            namespace=namespace, query=query, limit=limit, seen=seen
-        )
-        return _interleaved(edge_facts, node_facts, episode_facts, similar)[:limit]
+        return edge_facts, node_facts, episode_facts
 
     async def _similar_episodes(
-        self, *, namespace: str, query: str, limit: int, seen: set[str]
+        self, *, namespace: str, embedding: list[float] | None, limit: int
     ) -> list[KnowledgeFact]:
         """Recall episodes whose meaning matches, not whose words do."""
+        if embedding is None:
+            return []
         try:
-            embedding = await self._graphiti.embedder.create(input_data=query)
             rows, _, _ = await self._graphiti.driver.execute_query(
                 EPISODE_SIMILARITY,
                 namespace=namespace,
@@ -191,10 +301,11 @@ class GraphitiKnowledgeMemory:
                 routing_="r",
             )
         except Exception as error:
-            # Keyword recall already ran: degrade to it rather than lose the answer.
+            # The other layers can still answer if episode similarity is down.
             logger.warning("knowledge.embed.failed query reason=%s", _reason(error))
             return []
         facts: list[KnowledgeFact] = []
+        seen: set[str] = set()
         for row in rows:
             text = _without_speaker(row["content"])
             if not text or text in seen:
@@ -204,10 +315,82 @@ class GraphitiKnowledgeMemory:
                 KnowledgeFact(
                     fact=text,
                     valid_from=_as_datetime(row["valid_at"]),
+                    stated_at=_as_datetime(row["valid_at"]),
                     source=row["name"],
+                    ref=f"{EPISODE_REF}{row['uuid']}",
                 )
             )
         return facts
+
+    async def forget(self, *, namespace: str, refs: list[str]) -> list[str]:
+        """Erase the referenced facts and every copy of their wording.
+
+        One fact lives in up to three places: an edge, the episode that stated
+        it and the summaries of the entities it joins. Erasing only the
+        selected element would let recall find the same sentence in another
+        layer, so the wording of whatever was selected goes everywhere in this
+        namespace. The statements run one by one: a failure midway leaves less
+        of the fact behind, never more.
+        """
+        edges = _refs(refs, EDGE_REF)
+        nodes = set(_refs(refs, NODE_REF))
+        episodes = _refs(refs, EPISODE_REF)
+        try:
+            texts = [
+                row["text"]
+                for row in await self._read(READ_EDGE_FACTS, namespace, uuids=edges)
+            ] + [
+                _without_speaker(row["content"])
+                for row in await self._read(
+                    READ_EPISODE_CONTENTS, namespace, uuids=episodes
+                )
+            ]
+            wording = sorted({text for text in texts if text})
+            deleted_edges = await self._write(
+                FORGET_EDGES, namespace, uuids=edges, texts=wording
+            )
+            deleted_episodes = await self._write(
+                FORGET_EPISODES,
+                namespace,
+                uuids=episodes,
+                contents=[
+                    *wording,
+                    *(f"{MESSAGE_SPEAKER}: {text}" for text in wording),
+                ],
+            )
+            touched = {row["source"] for row in deleted_edges} | {
+                row["target"] for row in deleted_edges
+            }
+            forgotten = [row["text"] for row in deleted_edges] + [
+                _without_speaker(row["content"]) for row in deleted_episodes
+            ]
+            for row in await self._read(READ_SUMMARIES, namespace):
+                summary, erased = _erased(
+                    row["summary"], wording=wording, whole=row["uuid"] in nodes
+                )
+                if not erased:
+                    continue
+                await self._write(
+                    SET_SUMMARY, namespace, uuid=row["uuid"], summary=summary
+                )
+                touched.add(row["uuid"])
+                forgotten.extend(erased)
+            await self._write(DROP_ORPHANS, namespace, uuids=sorted(touched))
+        except Exception as error:
+            raise KnowledgeMemoryError(_reason(error)) from error
+        return list(dict.fromkeys(text for text in forgotten if text))
+
+    async def _read(self, query: str, namespace: str, **parameters: Any) -> list[Any]:
+        rows, _, _ = await self._graphiti.driver.execute_query(
+            query, namespace=namespace, routing_="r", **parameters
+        )
+        return list(rows)
+
+    async def _write(self, query: str, namespace: str, **parameters: Any) -> list[Any]:
+        rows, _, _ = await self._graphiti.driver.execute_query(
+            query, namespace=namespace, **parameters
+        )
+        return list(rows)
 
     async def healthcheck(self) -> bool:
         try:
@@ -225,12 +408,7 @@ class GraphitiKnowledgeMemory:
         # semantic shortlist. Missing watch dates never mean "watched today".
         try:
             rows, _, _ = await self._graphiti.driver.execute_query(
-                "MATCH (episode:Episodic {group_id: $namespace}) "
-                "WHERE episode.source_description = 'structured film export' "
-                "AND episode.watched_at IS NOT NULL "
-                "RETURN episode.content AS content, episode.name AS name, "
-                "episode.watched_at AS watched_at "
-                "ORDER BY episode.watched_at DESC, episode.name ASC LIMIT $limit",
+                RECENT_WATCHED_FILMS,
                 namespace=namespace,
                 limit=limit,
                 routing_="r",
@@ -249,12 +427,34 @@ class GraphitiKnowledgeMemory:
     async def close(self) -> None:
         await self._graphiti.close()  # type: ignore[no-untyped-call]
 
+    async def profile_facts(self, *, namespace: str, limit: int) -> list[KnowledgeFact]:
+        try:
+            rows, _, _ = await self._graphiti.driver.execute_query(
+                PROFILE_EPISODES, namespace=namespace, limit=limit, routing_="r"
+            )
+        except Exception as error:
+            raise KnowledgeMemoryError(_reason(error)) from error
+        facts: list[KnowledgeFact] = []
+        seen: set[str] = set()
+        for row in reversed(rows):
+            text = _without_speaker(row["content"] or "")
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            facts.append(
+                KnowledgeFact(
+                    fact=text,
+                    valid_from=_as_datetime(row["valid_at"]),
+                    stated_at=_as_datetime(row["valid_at"]),
+                    source=row["name"],
+                )
+            )
+        return facts
+
     async def watched_film_titles(self, *, namespace: str) -> list[str]:
         try:
             rows, _, _ = await self._graphiti.driver.execute_query(
-                "MATCH (episode:Episodic {group_id: $namespace}) "
-                "WHERE episode.source_description = 'structured film export' "
-                "RETURN episode.content AS content",
+                WATCHED_FILM_CONTENTS,
                 namespace=namespace,
                 routing_="r",
             )
@@ -269,10 +469,10 @@ class GraphitiKnowledgeMemory:
         except Exception as error:
             raise KnowledgeMemoryError(_reason(error)) from error
 
-    async def _episode_names(
+    async def _episode_sources(
         self, *, namespace: str, uuids: list[str]
-    ) -> dict[str, str]:
-        """Map episode uuids to their provenance names within one namespace."""
+    ) -> dict[str, tuple[str, datetime | None]]:
+        """Map episode uuids to their name and time within one namespace."""
         unique = list(dict.fromkeys(uuids))
         if not unique:
             return {}
@@ -280,10 +480,22 @@ class GraphitiKnowledgeMemory:
             self._graphiti.driver, unique
         )
         return {
-            episode.uuid: episode.name
+            episode.uuid: (episode.name, episode.valid_at)
             for episode in episodes
             if episode.group_id == namespace
         }
+
+
+def _latest(
+    sources: dict[str, tuple[str, datetime | None]], uuids: list[str]
+) -> datetime | None:
+    """When the fact was last stated, over the episodes an edge came from."""
+    stated = [
+        moment
+        for uuid in uuids
+        if (moment := sources.get(uuid, ("", None))[1]) is not None
+    ]
+    return max(stated) if stated else None
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -293,6 +505,26 @@ def _as_datetime(value: Any) -> datetime | None:
     to_native = getattr(value, "to_native", None)
     converted = to_native() if callable(to_native) else None
     return converted if isinstance(converted, datetime) else None
+
+
+def _refs(refs: list[str], prefix: str) -> list[str]:
+    return sorted({ref.removeprefix(prefix) for ref in refs if ref.startswith(prefix)})
+
+
+def _erased(summary: str, *, wording: list[str], whole: bool) -> tuple[str, list[str]]:
+    """Drop the summary lines that repeat forgotten wording.
+
+    A summary the model selected itself goes entirely when no line matches:
+    Graphiti may have paraphrased the fact into prose.
+    """
+    forgotten = {text.casefold() for text in wording}
+    kept: list[str] = []
+    erased: list[str] = []
+    for line in summary.splitlines():
+        (erased if line.strip().casefold() in forgotten else kept).append(line)
+    if whole and not erased:
+        return "", [summary]
+    return "\n".join(kept), [line.strip() for line in erased]
 
 
 def _without_speaker(content: str) -> str:

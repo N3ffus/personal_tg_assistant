@@ -6,7 +6,8 @@ from openai import AsyncOpenAI, OpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 from pydantic import BaseModel
 
-from evals.settings import DEEPINFRA_BASE_URL, EvalSettings
+from evals.settings import EvalSettings
+from src.config import DEEPINFRA_BASE_URL
 
 
 # DeepEval's subclass instrumentation hook is not annotated.

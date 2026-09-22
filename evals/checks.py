@@ -66,3 +66,9 @@ def assert_contract(
         assert fragment in run.reply
     for fragment in scenario.reply_excludes:
         assert fragment not in run.reply, f"Forbidden fragment in reply: {fragment}"
+    if scenario.films_shown is not None:
+        # Every recommended film is rendered on its own line as «Title».
+        shown = [line for line in run.reply.splitlines() if line.startswith("«")]
+        assert len(shown) == scenario.films_shown, (
+            f"Expected {scenario.films_shown} films, reply lists {len(shown)}"
+        )

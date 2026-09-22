@@ -44,8 +44,8 @@ Copy-Item .env.example .env
 TELEGRAM_BOT_TOKEN=your-telegram-token
 TELEGRAM_ALLOWED_USER_ID=your-numeric-telegram-user-id
 LLM_API_KEY=your-api-key
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-5.6
+LLM_BASE_URL=https://api.deepinfra.com/v1/openai
+LLM_MODEL=deepseek-ai/DeepSeek-V4.1-Flash
 GOOGLE_OAUTH_CLIENT_ID=your-client-id
 GOOGLE_OAUTH_CLIENT_SECRET=your-client-secret
 GOOGLE_OAUTH_REDIRECT_URI=https://your-domain.example/oauth/google/callback
@@ -276,7 +276,7 @@ DD.MM.YYYY в городе Y» — это три отдельных `remember_kn
 Даты в рёбра не попадают вообще: извлечение не создаёт сущность для даты, и
 ребро вида «дата рождения» отбрасывается. Поэтому каждое сообщение сохраняется
 ещё и вектором, а поиск дополнительно сравнивает смысл запроса с исходными
-сообщениями — иначе «сколько мне лет» никогда бы не нашло «родился 02.05.2003».
+сообщениями — иначе «сколько мне лет» никогда бы не нашло «родился 01.02.2003».
 Для сообщений, сохранённых до этого, есть разовый
 `python -m scripts.backfill_episode_embeddings`.
 
@@ -297,8 +297,8 @@ GRAPHITI_LLM_MODEL=
 GRAPHITI_LLM_API_KEY=
 GRAPHITI_LLM_BASE_URL=
 GRAPHITI_LLM_STRUCTURED_OUTPUT=json_schema
-GRAPHITI_EMBEDDING_MODEL=text-embedding-3-small
-GRAPHITI_EMBEDDING_DIM=1536
+GRAPHITI_EMBEDDING_MODEL=BAAI/bge-m3
+GRAPHITI_EMBEDDING_DIM=1024
 GRAPHITI_EMBEDDING_API_KEY=
 GRAPHITI_EMBEDDING_BASE_URL=
 ```

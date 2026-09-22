@@ -229,3 +229,10 @@ AGENTS.md
 .deepeval/
 .deepeval*
 eval-results/
+
+# Local .env backups hold live credentials: never commit or ship them.
+.env.bak*
+.env.*.bak
+
+# Local scratch artefacts
+.lavish/

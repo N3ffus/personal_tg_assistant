@@ -10,7 +10,7 @@ from evals.checks import assert_contract
 from evals.harness import run_scenario
 from evals.scenarios import SCENARIOS, Scenario
 from evals.settings import load_eval_settings
-from src.infrastructure.llm.gonkagate import GonkaGateLLMClient
+from src.infrastructure.llm.client import ChatLLMClient
 
 if TYPE_CHECKING:
     from evals.judge import DeepInfraJudge
@@ -28,7 +28,7 @@ async def test_live_prompt_and_integrations(
     from deepeval.test_case import LLMTestCase, SingleTurnParams, ToolCall
 
     settings = load_eval_settings()
-    llm = GonkaGateLLMClient(
+    llm = ChatLLMClient(
         api_key=settings.llm_api_key.get_secret_value(),
         base_url=settings.llm_base_url,
         model=settings.llm_model,

@@ -84,12 +84,29 @@ class SearchKnowledgeAction(DomainModel):
 
     type: Literal[ActionType.SEARCH_KNOWLEDGE]
     query: str = Field(min_length=1, max_length=400)
-    mode: Literal["semantic", "recent_watched_films", "watched_film_catalogue"] = (
-        "semantic"
-    )
+    mode: Literal[
+        "semantic", "profile", "recent_watched_films", "watched_film_catalogue"
+    ] = "semantic"
     limit: int = Field(
         default=DEFAULT_KNOWLEDGE_RESULTS, ge=1, le=MAX_KNOWLEDGE_RESULTS
     )
+
+
+MAX_FORGOTTEN_FACTS = 20
+
+
+class ForgetKnowledgeAction(DomainModel):
+    """Erase what the user asked to forget, in two turns.
+
+    The first turn names the fact in ``query``; the application recalls the
+    candidates and shows them with their ``ref``. The answer turn repeats the
+    action with ``refs`` of exactly the facts the request covers, so a similar
+    but different fact (the previous employer) is never erased by resemblance.
+    """
+
+    type: Literal[ActionType.FORGET_KNOWLEDGE]
+    query: str = Field(min_length=1, max_length=400)
+    refs: list[str] = Field(default_factory=list, max_length=MAX_FORGOTTEN_FACTS)
 
 
 # A batch has to outnumber what the user asked for: most of it is filtered out
@@ -111,8 +128,11 @@ class FilmCandidate(DomainModel):
 
 class RecommendFilmsAction(DomainModel):
     type: Literal[ActionType.RECOMMEND_FILMS]
+    # An empty list is tolerated on purpose: a model that sends one would
+    # otherwise fail validation and cost the user the whole reply, while the
+    # executor already answers «не удалось подобрать» for an empty selection.
     candidates: list[FilmCandidate] = Field(
-        min_length=1, max_length=MAX_FILM_CANDIDATES
+        min_length=0, max_length=MAX_FILM_CANDIDATES
     )
     limit: int = Field(default=3, ge=1, le=10)
 
@@ -131,6 +151,7 @@ AssistantAction = Annotated[
     | SaveNoteAction
     | RememberKnowledgeAction
     | SearchKnowledgeAction
+    | ForgetKnowledgeAction
     | RecommendFilmsAction,
     Field(discriminator="type"),
 ]

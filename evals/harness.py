@@ -271,10 +271,40 @@ class RecordingKnowledge:
     async def close(self) -> None:
         return None
 
+    async def profile_facts(self, *, namespace: str, limit: int) -> list[KnowledgeFact]:
+        facts = [KnowledgeFact(fact=fact) for fact in self.facts][-limit:]
+        self.calls.append(
+            RecordedCall(
+                "knowledge.profile_facts",
+                {"limit": limit},
+                [fact.fact for fact in facts],
+            )
+        )
+        return facts
+
     async def watched_film_titles(self, *, namespace: str) -> list[str]:
         titles = list(self.facts)
         self.calls.append(RecordedCall("knowledge.watched_film_titles", {}, titles))
         return titles
+
+    async def forget_candidates(
+        self, *, namespace: str, query: str, limit: int
+    ) -> list[KnowledgeFact]:
+        facts = [
+            KnowledgeFact(fact=fact, ref=f"fact:{index}")
+            for index, fact in enumerate(self.facts)
+        ][:limit]
+        self.calls.append(
+            RecordedCall(
+                "knowledge.forget_candidates",
+                {"query": query, "limit": limit},
+                [fact.as_payload() for fact in facts],
+            )
+        )
+        return facts
+
+    async def forget(self, *, namespace: str, refs: list[str]) -> list[str]:
+        raise AssertionError("A recall scenario must not erase memory")
 
 
 @dataclass

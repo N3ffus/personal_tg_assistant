@@ -2,7 +2,7 @@ UV ?= uv
 IMAGE_NAME ?= personal-ai-assistant
 CONTAINER_NAME ?= personal-ai-assistant
 
-.PHONY: install run lint format typecheck test test-integration eval eval-report check docker-build docker-run docker-remove docker-stop docker-logs knowledge-demo neo4j-up neo4j-down
+.PHONY: install run lint format typecheck test test-integration eval eval-memory eval-report check docker-build docker-run docker-remove docker-stop docker-logs knowledge-demo neo4j-up neo4j-down
 
 install:
 	$(UV) sync --all-groups
@@ -28,7 +28,10 @@ test-integration:
 	$(UV) run pytest tests/integration -m integration -v
 
 eval:
-	$(UV) run --group eval pytest evals --run-llm-evals -m llm_eval -v --junitxml=eval-results/junit.xml -o junit_family=xunit1
+	$(UV) run --group eval pytest evals --run-llm-evals -m "llm_eval and not memory_eval" -v --junitxml=eval-results/junit.xml -o junit_family=xunit1
+
+eval-memory:
+	$(UV) run --group eval pytest evals/test_memory.py --run-llm-evals -m memory_eval -v --junitxml=eval-results/memory-junit.xml -o junit_family=xunit1
 
 eval-report:
 	$(UV) run --group eval python -m scripts.eval_report
