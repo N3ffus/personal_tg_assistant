@@ -1,10 +1,10 @@
 from pathlib import Path
 from typing import Literal
 
-import aiosqlite
 from cryptography.fernet import Fernet
 
 from src.domain.assistant.context import ChatContext, ContextChat
+from src.infrastructure.sqlite import connect, use_write_ahead_log
 
 
 class ContextStorage:
@@ -14,7 +14,8 @@ class ContextStorage:
 
     async def initialize(self) -> None:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
+            await use_write_ahead_log(database)
             await database.execute(
                 """CREATE TABLE IF NOT EXISTS chat_contexts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +38,7 @@ class ContextStorage:
         title: str,
     ) -> ContextChat:
         title = title[:150]
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 """INSERT INTO chat_contexts (owner_id, kind, chat_id, title, payload)
                 VALUES (?, ?, ?, ?, ?)
@@ -59,7 +60,7 @@ class ContextStorage:
         )
 
     async def list_chats(self, *, owner_id: int) -> list[ContextChat]:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 "SELECT id, kind, chat_id, title FROM chat_contexts WHERE owner_id=? ORDER BY kind, id",
                 (owner_id,),
@@ -77,7 +78,7 @@ class ContextStorage:
         ]
 
     async def load(self, *, owner_id: int, context_id: int) -> ChatContext | None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 "SELECT payload FROM chat_contexts WHERE owner_id=? AND id=?",
                 (owner_id, context_id),
@@ -92,7 +93,7 @@ class ContextStorage:
     async def save(
         self, *, owner_id: int, context_id: int, context: ChatContext
     ) -> None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             await database.execute(
                 "UPDATE chat_contexts SET payload=? WHERE owner_id=? AND id=?",
                 (

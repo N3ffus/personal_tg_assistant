@@ -2,10 +2,10 @@ import hashlib
 import json
 from pathlib import Path
 
-import aiosqlite
 from cryptography.fernet import Fernet
 
 from src.domain.assistant.business import BusinessIntent, StoredBusinessAction
+from src.infrastructure.sqlite import connect, use_write_ahead_log
 
 
 class BusinessStorage:
@@ -15,7 +15,8 @@ class BusinessStorage:
 
     async def initialize(self) -> None:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
+            await use_write_ahead_log(db)
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS business_cursors (
                     owner_id INTEGER NOT NULL, context_id INTEGER NOT NULL,
@@ -33,7 +34,7 @@ class BusinessStorage:
             """)
 
     async def cursor(self, *, owner_id: int, context_id: int) -> int:
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             cursor = await db.execute(
                 "SELECT last_message_id FROM business_cursors WHERE owner_id=? AND context_id=?",
                 (owner_id, context_id),
@@ -51,7 +52,7 @@ class BusinessStorage:
         intents: list[BusinessIntent],
     ) -> bool:
         # The cursor and immutable plan commit together, before any remote write.
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 "SELECT last_message_id FROM business_cursors WHERE owner_id=? AND context_id=?",
@@ -91,7 +92,7 @@ class BusinessStorage:
     async def outstanding(
         self, *, owner_id: int, context_id: int
     ) -> list[StoredBusinessAction]:
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             cursor = await db.execute(
                 "SELECT id, payload, status, result FROM business_actions WHERE owner_id=? AND context_id=? AND notified=0 ORDER BY rowid",
                 (owner_id, context_id),
@@ -112,7 +113,7 @@ class BusinessStorage:
         ]
 
     async def claim(self, *, owner_id: int, action_id: str) -> bool:
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             cursor = await db.execute(
                 "UPDATE business_actions SET status='running' WHERE owner_id=? AND id=? AND status='pending'",
                 (owner_id, action_id),
@@ -122,7 +123,7 @@ class BusinessStorage:
 
     async def complete(self, *, owner_id: int, action_id: str, result: str) -> None:
         # Completed save_note payloads are the durable, encrypted note archive.
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             await db.execute(
                 "UPDATE business_actions SET status='completed', result=? WHERE owner_id=? AND id=?",
                 (self._cipher.encrypt(result.encode()), owner_id, action_id),
@@ -130,7 +131,7 @@ class BusinessStorage:
             await db.commit()
 
     async def notified(self, *, owner_id: int, action_id: str) -> None:
-        async with aiosqlite.connect(self._database_path) as db:
+        async with connect(self._database_path) as db:
             await db.execute(
                 "UPDATE business_actions SET notified=1 WHERE owner_id=? AND id=? AND status='completed'",
                 (owner_id, action_id),

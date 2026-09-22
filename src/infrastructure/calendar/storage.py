@@ -8,6 +8,8 @@ from typing import cast
 import aiosqlite
 from cryptography.fernet import Fernet
 
+from src.infrastructure.sqlite import connect, use_write_ahead_log
+
 
 class CalendarStorage:
     def __init__(self, *, database_path: str, encryption_key: str) -> None:
@@ -16,7 +18,8 @@ class CalendarStorage:
 
     async def initialize(self) -> None:
         Path(self._database_path).parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
+            await use_write_ahead_log(database)
             await database.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS oauth_states (
@@ -55,7 +58,7 @@ class CalendarStorage:
         state = secrets.token_urlsafe(32)
         expires_at = self._expires_in(minutes=10)
         encrypted_verifier = self._cipher.encrypt(code_verifier.encode())
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             await self._purge_expired(database)
             await database.execute(
                 "DELETE FROM oauth_states WHERE telegram_user_id = ?",
@@ -71,7 +74,7 @@ class CalendarStorage:
         return state
 
     async def consume_oauth_state(self, *, state: str) -> tuple[int, str] | None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 """DELETE FROM oauth_states WHERE state = ?
                 RETURNING telegram_user_id, expires_at, code_verifier""",
@@ -91,7 +94,7 @@ class CalendarStorage:
         self, *, user_id: int, credentials: Mapping[str, object]
     ) -> None:
         encrypted = self._cipher.encrypt(json.dumps(credentials).encode())
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             await database.execute(
                 """INSERT INTO calendar_connections (telegram_user_id, credentials)
                 VALUES (?, ?)
@@ -102,7 +105,7 @@ class CalendarStorage:
             await database.commit()
 
     async def load_credentials(self, *, user_id: int) -> dict[str, object] | None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 "SELECT credentials FROM calendar_connections WHERE telegram_user_id = ?",
                 (user_id,),
@@ -113,7 +116,7 @@ class CalendarStorage:
         return cast(dict[str, object], json.loads(self._cipher.decrypt(row[0])))
 
     async def delete_connection(self, *, user_id: int) -> None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             await database.execute(
                 "DELETE FROM calendar_connections WHERE telegram_user_id = ?",
                 (user_id,),
@@ -142,7 +145,7 @@ class CalendarStorage:
 
         operation_ids = [secrets.token_urlsafe(12) for _ in payloads]
         expires_at = self._expires_in(minutes=15)
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             await self._purge_expired(database)
             if kind == "select":
                 await database.execute(
@@ -171,7 +174,7 @@ class CalendarStorage:
     async def consume_operation(
         self, *, operation_id: str, user_id: int
     ) -> tuple[str, dict[str, object]] | None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 """DELETE FROM pending_operations
                 WHERE operation_id = ? AND telegram_user_id = ?
@@ -187,7 +190,7 @@ class CalendarStorage:
     async def consume_latest_operation(
         self, *, user_id: int, kind: str
     ) -> dict[str, object] | None:
-        async with aiosqlite.connect(self._database_path) as database:
+        async with connect(self._database_path) as database:
             cursor = await database.execute(
                 """DELETE FROM pending_operations
                 WHERE operation_id = (
