@@ -12,13 +12,20 @@ from src.application.services.explicit_commands import (
     parse_view_request,
 )
 from src.application.services.knowledge import KnowledgeService
+from src.application.services.reminders import ReminderService
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.domain.assistant.deletions import DeletionTarget
-from src.domain.assistant.models import AssistantDecision
+from src.domain.assistant.models import (
+    AssistantDecision,
+    CreateReminderAction,
+    DeleteReminderAction,
+    WatchCalendarAction,
+)
 from src.domain.assistant.replies import AssistantReply
 from src.domain.assistant.retrieval import EventQuery, TaskQuery
 from src.domain.calendar.models import CalendarEvent
 from src.domain.knowledge.models import KnowledgeEpisode, KnowledgeFact
+from src.domain.reminders.models import CalendarWatch, Schedule, StoredReminder
 from src.domain.tasks.models import CreatedTask, Task
 
 
@@ -345,6 +352,84 @@ class RecordingWeb:
         return None
 
 
+class MemoryReminderStore:
+    """A reminder store that lives for one scenario; the rest of the port is unused."""
+
+    def __init__(self) -> None:
+        self._reminders: list[StoredReminder] = []
+        self._watch: CalendarWatch | None = None
+
+    async def add(
+        self, *, owner_id: int, text: str, schedule: Schedule, next_run_at: datetime
+    ) -> StoredReminder:
+        reminder = StoredReminder(
+            len(self._reminders) + 1, owner_id, text, schedule, next_run_at
+        )
+        self._reminders.append(reminder)
+        return reminder
+
+    async def list_reminders(self, *, owner_id: int) -> list[StoredReminder]:
+        return [r for r in self._reminders if r.owner_id == owner_id]
+
+    async def delete(self, *, owner_id: int, reminder_id: int) -> bool:
+        before = len(self._reminders)
+        self._reminders = [r for r in self._reminders if r.id != reminder_id]
+        return len(self._reminders) < before
+
+    async def get_watch(self, *, owner_id: int) -> CalendarWatch | None:
+        return self._watch
+
+    async def save_watch(self, watch: CalendarWatch) -> None:
+        self._watch = watch
+
+
+class RecordingReminders(ReminderService):
+    """The real reminder service over an in-memory store, noting each action."""
+
+    def __init__(self, *, timezone: str, calls: list[RecordedCall]) -> None:
+        super().__init__(
+            store=MemoryReminderStore(),  # type: ignore[arg-type]
+            timezone=timezone,
+        )
+        self._calls = calls
+
+    async def create(
+        self, action: CreateReminderAction, *, user_id: int, now: datetime
+    ) -> str:
+        reply = await super().create(action, user_id=user_id, now=now)
+        self._calls.append(
+            RecordedCall(
+                "reminders.create_reminder", action.model_dump(mode="json"), reply
+            )
+        )
+        return reply
+
+    async def overview(self, *, user_id: int) -> str:
+        reply = await super().overview(user_id=user_id)
+        self._calls.append(RecordedCall("reminders.list_reminders", {}, reply))
+        return reply
+
+    async def delete(self, action: DeleteReminderAction, *, user_id: int) -> str:
+        reply = await super().delete(action, user_id=user_id)
+        self._calls.append(
+            RecordedCall(
+                "reminders.delete_reminder", action.model_dump(mode="json"), reply
+            )
+        )
+        return reply
+
+    async def watch(
+        self, action: WatchCalendarAction, *, user_id: int, now: datetime
+    ) -> str:
+        reply = await super().watch(action, user_id=user_id, now=now)
+        self._calls.append(
+            RecordedCall(
+                "reminders.watch_calendar", action.model_dump(mode="json"), reply
+            )
+        )
+        return reply
+
+
 @dataclass
 class RecordingLLM:
     inner: LLMClient
@@ -393,6 +478,9 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
             pending_operations=integrations,
             task_tracker=integrations,
             knowledge=knowledge,
+            reminders=RecordingReminders(
+                timezone=scenario.timezone, calls=integrations.calls
+            ),
         ),
         knowledge=knowledge,
         web=web,

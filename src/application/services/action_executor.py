@@ -17,6 +17,7 @@ from src.application.ports.tasks import (
 )
 from src.application.services.deletions import DeletionService
 from src.application.services.knowledge import KnowledgeService
+from src.application.services.reminders import ReminderService
 from src.application.services.retrieval import RetrievalService
 from src.domain.assistant.business import (
     BusinessAction,
@@ -28,20 +29,24 @@ from src.domain.assistant.models import (
     AssistantAction,
     ChatAction,
     CreateEventAction,
+    CreateReminderAction,
     CreateTaskAction,
     DeleteAllEventsAction,
     DeleteAllTasksAction,
     DeleteEventAction,
+    DeleteReminderAction,
     DeleteTaskAction,
     FilmCandidate,
     ForgetKnowledgeAction,
     ListEventsAction,
+    ListRemindersAction,
     ListTasksAction,
     RecommendFilmsAction,
     RememberKnowledgeAction,
     SaveNoteAction,
     SearchKnowledgeAction,
     UpdateEventAction,
+    WatchCalendarAction,
 )
 from src.domain.assistant.replies import AssistantReply, Confirmation, ResultPage
 from src.domain.assistant.retrieval import EventQuery, RetrievalLimitError, TaskQuery
@@ -84,8 +89,10 @@ class ActionExecutor:
         pending_operations: PendingOperationStore,
         task_tracker: TaskTrackerClient,
         knowledge: KnowledgeService | None = None,
+        reminders: ReminderService | None = None,
     ) -> None:
         self._calendar = calendar
+        self._reminders = reminders
         self._task_tracker = task_tracker
         self._knowledge = knowledge
         self._retrieval = RetrievalService(calendar=calendar, task_tracker=task_tracker)
@@ -382,6 +389,17 @@ class ActionExecutor:
                 )
             return reply
 
+        if isinstance(
+            action,
+            (
+                CreateReminderAction,
+                ListRemindersAction,
+                DeleteReminderAction,
+                WatchCalendarAction,
+            ),
+        ):
+            return await self._reminder_action(action, user_id=user_id, now=now)
+
         if isinstance(action, SearchKnowledgeAction):
             if self._knowledge is None:
                 return "⚠️ Долговременная память отключена, поиск по ней недоступен."
@@ -389,6 +407,28 @@ class ActionExecutor:
             return format_facts(facts)
 
         raise ValueError(f"Unsupported action: {type(action)!r}")
+
+    async def _reminder_action(
+        self,
+        action: (
+            CreateReminderAction
+            | ListRemindersAction
+            | DeleteReminderAction
+            | WatchCalendarAction
+        ),
+        *,
+        user_id: int,
+        now: datetime,
+    ) -> str:
+        if self._reminders is None:
+            return "⚠️ Напоминания сейчас недоступны."
+        if isinstance(action, CreateReminderAction):
+            return await self._reminders.create(action, user_id=user_id, now=now)
+        if isinstance(action, ListRemindersAction):
+            return await self._reminders.overview(user_id=user_id)
+        if isinstance(action, DeleteReminderAction):
+            return await self._reminders.delete(action, user_id=user_id)
+        return await self._reminders.watch(action, user_id=user_id, now=now)
 
     async def _remember(
         self,

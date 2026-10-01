@@ -19,3 +19,7 @@ class ActionType(StrEnum):
     READ_WEB_PAGE = "read_web_page"
     FORGET_KNOWLEDGE = "forget_knowledge"
     RECOMMEND_FILMS = "recommend_films"
+    CREATE_REMINDER = "create_reminder"
+    LIST_REMINDERS = "list_reminders"
+    DELETE_REMINDER = "delete_reminder"
+    WATCH_CALENDAR = "watch_calendar"

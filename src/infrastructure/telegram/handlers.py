@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, Message
 from src.application.ports.calendar import CalendarError, CalendarNotConnectedError
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
 from src.application.services.context import ContextService
+from src.application.services.reminders import ReminderService
 from src.application.use_cases.process_message import (
     ProcessMessageUseCase,
 )
@@ -31,6 +32,7 @@ def create_router(
     timezone: str,
     allowed_user_id: int,
     contexts: ContextService | None = None,
+    reminders: ReminderService | None = None,
 ) -> Router:
     router = Router(
         name=__name__,
@@ -140,6 +142,15 @@ def create_router(
     @router.message(Command("tasks", "agenda", "calendar"))
     async def view_handler(message: Message, command: CommandObject) -> None:
         await text_handler(message, command=command)
+
+    @router.message(Command("reminders"))
+    async def reminders_handler(message: Message) -> None:
+        if message.from_user is None or message.from_user.id != allowed_user_id:
+            return
+        if reminders is None:
+            await message.answer("Напоминания сейчас недоступны.")
+            return
+        await answer_text(message, await reminders.overview(user_id=allowed_user_id))
 
     @router.message(F.text.startswith("/"))
     async def unknown_command_handler(message: Message) -> None:

@@ -149,6 +149,44 @@ class RecommendFilmsAction(DomainModel):
     limit: int = Field(default=3, ge=1, le=10)
 
 
+class CreateReminderAction(DomainModel):
+    """Schedule a message the bot sends the owner by itself.
+
+    Kept lenient on purpose: ``time``, ``date`` and ``weekdays`` are checked by
+    the reminder service, which answers with a question. A strict schema here
+    would turn a model slip into a lost reply.
+    """
+
+    type: Literal[ActionType.CREATE_REMINDER]
+    text: str = Field(min_length=1, max_length=300)
+    repeat: Literal["once", "daily", "weekly", "monthly", "yearly"] = "once"
+    time: str | None = None
+    date: str | None = None
+    weekdays: list[int] = Field(default_factory=list)
+    day_of_month: int | None = None
+    days_before: int = 0
+
+
+class ListRemindersAction(DomainModel):
+    type: Literal[ActionType.LIST_REMINDERS]
+
+
+class DeleteReminderAction(DomainModel):
+    """Cancel a reminder by words from its text or by its number (``#3``)."""
+
+    type: Literal[ActionType.DELETE_REMINDER]
+    query: str = Field(min_length=1, max_length=200)
+
+
+class WatchCalendarAction(DomainModel):
+    """Turn the periodic Google Calendar look-ahead on or off, or retune it."""
+
+    type: Literal[ActionType.WATCH_CALENDAR]
+    enabled: bool = True
+    lead_minutes: int | None = None
+    interval_minutes: int | None = None
+
+
 AssistantAction = Annotated[
     ChatAction
     | CreateTaskAction
@@ -166,7 +204,11 @@ AssistantAction = Annotated[
     | SearchWebAction
     | ReadWebPageAction
     | ForgetKnowledgeAction
-    | RecommendFilmsAction,
+    | RecommendFilmsAction
+    | CreateReminderAction
+    | ListRemindersAction
+    | DeleteReminderAction
+    | WatchCalendarAction,
     Field(discriminator="type"),
 ]
 

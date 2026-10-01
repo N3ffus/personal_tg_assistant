@@ -1,12 +1,16 @@
 import asyncio
 import logging
 from contextlib import AsyncExitStack
+from typing import Protocol
 
 import uvicorn
 from aiogram import Bot, Dispatcher
 
 from src.application.services.action_executor import ActionExecutor
+from src.application.services.calendar_watch import CalendarWatcher
 from src.application.services.context import ContextService
+from src.application.services.reminder_scheduler import ReminderScheduler
+from src.application.services.reminders import ReminderService
 from src.application.use_cases.process_business_dialog import ProcessBusinessDialog
 from src.application.use_cases.process_message import ProcessMessageUseCase
 from src.config import Settings
@@ -18,6 +22,7 @@ from src.infrastructure.context.storage import ContextStorage
 from src.infrastructure.films.tmdb import TMDBFilmDirectory
 from src.infrastructure.knowledge.factory import create_knowledge_service
 from src.infrastructure.llm.client import ChatLLMClient
+from src.infrastructure.reminders.storage import ReminderStorage
 from src.infrastructure.tasks.linear import LinearTaskClient
 from src.infrastructure.telegram.business import create_business_router
 from src.infrastructure.telegram.business_worker import (
@@ -28,14 +33,23 @@ from src.infrastructure.telegram.calendar import create_calendar_router
 from src.infrastructure.telegram.commands import configure_commands
 from src.infrastructure.telegram.context import create_context_router
 from src.infrastructure.telegram.handlers import create_router
+from src.infrastructure.telegram.notifier import TelegramNotifier
 from src.infrastructure.web.pages import HttpWebPageReader
 from src.infrastructure.web.tavily import TavilyWebSearch
 
 POLLING_CONCURRENCY_LIMIT = 32
 
 
+class BackgroundService(Protocol):
+    async def run(self) -> None: ...
+
+
 async def _run_services(
-    *, dispatcher: Dispatcher, bot: Bot, server: uvicorn.Server
+    *,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    server: uvicorn.Server,
+    scheduler: BackgroundService | None = None,
 ) -> None:
     polling = asyncio.create_task(
         dispatcher.start_polling(
@@ -48,6 +62,8 @@ async def _run_services(
     )
     serving = asyncio.create_task(server.serve(), name="oauth-http-server")
     services = {polling, serving}
+    if scheduler is not None:
+        services.add(asyncio.create_task(scheduler.run(), name="reminder-scheduler"))
 
     try:
         done, _ = await asyncio.wait(
@@ -102,6 +118,14 @@ async def main() -> None:
         )
         await business_storage.initialize()
 
+        reminder_storage = ReminderStorage(
+            database_path=settings.database_path, encryption_key=encryption_key
+        )
+        await reminder_storage.initialize()
+        reminders = ReminderService(
+            store=reminder_storage, timezone=settings.app_timezone
+        )
+
         contexts = ContextService(storage=context_storage, summarizer=llm)
         calendar = GoogleCalendarClient(storage=storage)
         oauth = GoogleOAuthService(
@@ -126,9 +150,22 @@ async def main() -> None:
             pending_operations=storage,
             task_tracker=task_tracker,
             knowledge=knowledge,
+            reminders=reminders,
         )
         bot = Bot(token=settings.telegram_bot_token.get_secret_value())
         resources.push_async_callback(bot.session.close)
+        notifier = TelegramNotifier(bot=bot)
+        scheduler = ReminderScheduler(
+            store=reminder_storage,
+            notifier=notifier,
+            timezone=settings.app_timezone,
+            watcher=CalendarWatcher(
+                calendar=calendar,
+                store=reminder_storage,
+                notifier=notifier,
+                timezone=settings.app_timezone,
+            ),
+        )
         business_worker = BusinessDialogWorker(
             processor=ProcessBusinessDialog(
                 contexts=contexts,
@@ -169,6 +206,7 @@ async def main() -> None:
                 timezone=settings.app_timezone,
                 allowed_user_id=owner_id,
                 contexts=contexts,
+                reminders=reminders,
             ),
         )
 
@@ -184,7 +222,9 @@ async def main() -> None:
                 access_log=False,
             )
         )
-        await _run_services(dispatcher=dispatcher, bot=bot, server=server)
+        await _run_services(
+            dispatcher=dispatcher, bot=bot, server=server, scheduler=scheduler
+        )
 
 
 if __name__ == "__main__":

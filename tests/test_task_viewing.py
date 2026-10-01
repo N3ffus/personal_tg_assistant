@@ -284,6 +284,7 @@ async def test_menu_includes_all_commands_and_is_synchronized() -> None:
         "tasks",
         "agenda",
         "calendar",
+        "reminders",
         "calendar_connect",
         "calendar_disconnect",
     }

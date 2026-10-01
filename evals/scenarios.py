@@ -533,4 +533,117 @@ SCENARIOS = (
             {"type": "read_web_page", "url": "https://news.example/lesna-bridge"},
         ),
     ),
+    Scenario(
+        "reminder_for_a_birthday_defaults_to_the_day_before",
+        "У Маши день рождения 14 мая, напоминай мне об этом",
+        (
+            {
+                "type": "create_reminder",
+                "text": "Завтра день рождения у Маши",
+                "repeat": "yearly",
+                "date": "2027-05-14",
+                "days_before": 1,
+            },
+        ),
+        ("reminders.create_reminder",),
+        "Создать ежегодное напоминание о дне рождения за день до даты, в 9:00. "
+        "Это напоминание, а не задача Linear и не событие календаря.",
+        ("каждый год, за день до 14 мая, в 09:00",),
+    ),
+    Scenario(
+        "a_daily_reminder_keeps_the_stated_time",
+        "Напоминай мне каждый день в 8:30 пить таблетки",
+        (
+            {
+                "type": "create_reminder",
+                "text": "Выпить таблетки",
+                "repeat": "daily",
+                "time": "08:30",
+            },
+        ),
+        ("reminders.create_reminder",),
+        "Создать ежедневное напоминание в 08:30.",
+        ("каждый день в 08:30",),
+    ),
+    Scenario(
+        "weekday_reminders_use_monday_to_friday",
+        "Напоминай по будням в 10 утра про стендап",
+        (
+            {
+                "type": "create_reminder",
+                "text": "Стендап",
+                "repeat": "weekly",
+                "weekdays": [0, 1, 2, 3, 4],
+                "time": "10:00",
+            },
+        ),
+        ("reminders.create_reminder",),
+        "Создать еженедельное напоминание с понедельника по пятницу в 10:00.",
+        ("еженедельно (пн, вт, ср, чт, пт) в 10:00",),
+    ),
+    Scenario(
+        "a_relative_reminder_is_counted_from_the_current_time",
+        "Напомни через 2 часа позвонить маме",
+        (
+            {
+                "type": "create_reminder",
+                "text": "Позвонить маме",
+                "repeat": "once",
+                "date": "2026-09-05",
+                "time": "14:00",
+            },
+        ),
+        ("reminders.create_reminder",),
+        "Создать разовое напоминание на сегодня, 5 сентября 2026, в 14:00 "
+        "(сейчас 12:00 по Москве).",
+        ("один раз, 05.09.2026, в 14:00",),
+    ),
+    Scenario(
+        "remind_me_is_not_a_task",
+        "Напомни завтра в 18:00 купить хлеб",
+        (
+            {
+                "type": "create_reminder",
+                "text": "Купить хлеб",
+                "repeat": "once",
+                "date": "2026-09-06",
+                "time": "18:00",
+            },
+        ),
+        ("reminders.create_reminder",),
+        "Создать разовое напоминание на завтра в 18:00, а не задачу Linear.",
+        ("один раз, 06.09.2026, в 18:00",),
+    ),
+    Scenario(
+        "a_reminder_without_a_date_asks_for_it",
+        "Напомни мне про врача",
+        ({"type": "chat", "text": "Когда напомнить про врача?"},),
+        (),
+        "Не создавать напоминание и задать один вопрос: когда напомнить.",
+    ),
+    Scenario(
+        "scheduled_things_are_listed_by_the_application",
+        "Что у меня запланировано?",
+        ({"type": "list_reminders"},),
+        ("reminders.list_reminders",),
+        "Показать список напоминаний через приложение, а не выдумывать его.",
+        ("Напоминаний пока нет",),
+    ),
+    Scenario(
+        "a_reminder_is_cancelled_by_its_words",
+        "Удали напоминание про таблетки",
+        ({"type": "delete_reminder", "query": "таблетки"},),
+        ("reminders.delete_reminder",),
+        "Отменить напоминание про таблетки (его нет, приложение так и скажет). "
+        "Не удалять задачи или события.",
+        ("не найдено",),
+    ),
+    Scenario(
+        "the_calendar_look_ahead_is_configured_from_chat",
+        "Следи за календарём и предупреждай о встречах за 2 часа",
+        ({"type": "watch_calendar", "enabled": True, "lead_minutes": 120},),
+        ("reminders.watch_calendar",),
+        "Включить слежение за календарём с предупреждением за 120 минут.",
+        ("за 120 мин",),
+    ),
 )

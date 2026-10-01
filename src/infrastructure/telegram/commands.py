@@ -14,6 +14,7 @@ BOT_COMMANDS = (
     BotCommand(command="tasks", description="Задачи Linear со статусами и ссылками"),
     BotCommand(command="agenda", description="Задачи Linear и события календаря"),
     BotCommand(command="calendar", description="Ближайшие события календаря"),
+    BotCommand(command="reminders", description="Напоминания и слежение за календарём"),
     BotCommand(command="calendar_connect", description="Подключить Google Calendar"),
     BotCommand(command="calendar_disconnect", description="Отключить Google Calendar"),
 )
