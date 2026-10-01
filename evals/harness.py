@@ -5,6 +5,7 @@ from evals.scenarios import Scenario
 from src.application.ports.calendar import CalendarError, CalendarNotConnectedError
 from src.application.ports.llm import LLMClient
 from src.application.ports.tasks import TaskCreationUncertainError, TaskTrackerError
+from src.application.ports.web import WebPage, WebPageError, WebResult
 from src.application.services.action_executor import ActionExecutor
 from src.application.services.explicit_commands import (
     parse_bulk_deletion,
@@ -308,6 +309,43 @@ class RecordingKnowledge:
 
 
 @dataclass
+class RecordingWeb:
+    """The scenario's internet, recorded apart from the integrations like memory.
+
+    Going online maps to no executed action, yet the judge must see what the
+    pages said, and a scenario that declares no web access must make none.
+    """
+
+    scenario: Scenario
+    calls: list[RecordedCall] = field(default_factory=list)
+
+    async def search(self, query: str) -> list[WebResult]:
+        results = list(self.scenario.web_results)
+        self.calls.append(
+            RecordedCall(
+                "web.search",
+                {"query": query},
+                [asdict(result) for result in results],
+            )
+        )
+        return results
+
+    async def read(self, url: str) -> WebPage:
+        text = dict(self.scenario.web_pages).get(url)
+        if text is None:
+            self.calls.append(
+                RecordedCall("web.read", {"url": url}, error="WebPageError")
+            )
+            raise WebPageError("the scenario has no such page")
+        page = WebPage(url=url, title="", text=text)
+        self.calls.append(RecordedCall("web.read", {"url": url}, asdict(page)))
+        return page
+
+    async def close(self) -> None:
+        return None
+
+
+@dataclass
 class RecordingLLM:
     inner: LLMClient
     decision: AssistantDecision | None = None
@@ -320,6 +358,7 @@ class RecordingLLM:
         timezone: str,
         context: str = "",
         knowledge: str = "",
+        web_results: str = "",
     ) -> AssistantDecision:
         self.decision = await self.inner.parse_message(
             text=text,
@@ -327,6 +366,7 @@ class RecordingLLM:
             timezone=timezone,
             context=context,
             knowledge=knowledge,
+            web_results=web_results,
         )
         return self.decision
 
@@ -337,6 +377,7 @@ class EvaluationRun:
     calls: list[RecordedCall]
     reply: str
     memory: list[RecordedCall] = field(default_factory=list)
+    web: list[RecordedCall] = field(default_factory=list)
 
 
 async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
@@ -344,6 +385,7 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
     recording_llm = RecordingLLM(llm)
     memory = RecordingKnowledge(scenario.knowledge_facts)
     knowledge = KnowledgeService(memory=memory) if scenario.knowledge_facts else None
+    web = RecordingWeb(scenario)
     use_case = ProcessMessageUseCase(
         llm=recording_llm,
         action_executor=ActionExecutor(
@@ -353,6 +395,8 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
             knowledge=knowledge,
         ),
         knowledge=knowledge,
+        web=web,
+        pages=web,
     )
     reply = await use_case.execute(
         text=scenario.prompt,
@@ -374,4 +418,4 @@ async def run_scenario(scenario: Scenario, llm: LLMClient) -> EvaluationRun:
                 *(p.text for p in reply.pages),
             ]
         )
-    return EvaluationRun(decision, integrations.calls, reply, memory.calls)
+    return EvaluationRun(decision, integrations.calls, reply, memory.calls, web.calls)

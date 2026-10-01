@@ -28,4 +28,5 @@ class LLMClient(Protocol):
         timezone: str,
         context: str = "",
         knowledge: str = "",
+        web_results: str = "",
     ) -> AssistantDecision: ...

@@ -92,6 +92,18 @@ class SearchKnowledgeAction(DomainModel):
     )
 
 
+class SearchWebAction(DomainModel):
+    type: Literal[ActionType.SEARCH_WEB]
+    query: str = Field(min_length=1, max_length=400)
+
+
+class ReadWebPageAction(DomainModel):
+    """Open a link the conversation holds; the backend refuses any other."""
+
+    type: Literal[ActionType.READ_WEB_PAGE]
+    url: str = Field(min_length=1, max_length=2000)
+
+
 MAX_FORGOTTEN_FACTS = 20
 
 
@@ -151,6 +163,8 @@ AssistantAction = Annotated[
     | SaveNoteAction
     | RememberKnowledgeAction
     | SearchKnowledgeAction
+    | SearchWebAction
+    | ReadWebPageAction
     | ForgetKnowledgeAction
     | RecommendFilmsAction,
     Field(discriminator="type"),

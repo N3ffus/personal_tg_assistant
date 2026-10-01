@@ -1,6 +1,8 @@
 from evals.harness import EvaluationRun
 from evals.scenarios import Scenario
 
+WEB_CALLS = {"search_web": "web.search", "read_web_page": "web.read"}
+
 
 def assert_contract(
     scenario: Scenario, run: EvaluationRun, *, exact_text: bool = False
@@ -9,6 +11,12 @@ def assert_contract(
     expected = scenario.golden_decision()
     assert [a.type for a in run.decision.actions] == [a.type for a in expected.actions]
     assert tuple(call.name for call in run.calls) == scenario.tools
+    # Going online where nothing asks for it costs a paid search and seconds of
+    # latency; a scenario without web_actions forbids it outright.
+    expected_web = {WEB_CALLS[str(action["type"])] for action in scenario.web_actions}
+    assert {call.name for call in run.web} == expected_web, (
+        f"Web calls {[call.name for call in run.web]}, expected {sorted(expected_web)}"
+    )
     for actual, golden in zip(run.decision.actions, expected.actions, strict=True):
         golden_data = golden.model_dump(mode="json")
         actual_data = actual.model_dump(mode="json")

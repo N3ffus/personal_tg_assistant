@@ -28,6 +28,8 @@ from src.infrastructure.telegram.calendar import create_calendar_router
 from src.infrastructure.telegram.commands import configure_commands
 from src.infrastructure.telegram.context import create_context_router
 from src.infrastructure.telegram.handlers import create_router
+from src.infrastructure.web.brave import BraveWebSearch
+from src.infrastructure.web.pages import HttpWebPageReader
 
 POLLING_CONCURRENCY_LIMIT = 32
 
@@ -79,6 +81,15 @@ async def main() -> None:
         if settings.tmdb_api_key.get_secret_value():
             films = TMDBFilmDirectory(api_key=settings.tmdb_api_key.get_secret_value())
             resources.push_async_callback(films.close)
+        web = None
+        if settings.brave_search_api_key.get_secret_value():
+            web = BraveWebSearch(
+                api_key=settings.brave_search_api_key.get_secret_value()
+            )
+            resources.push_async_callback(web.close)
+        # Reading a sent link needs no account: only public addresses are opened.
+        pages = HttpWebPageReader()
+        resources.push_async_callback(pages.close)
 
         storage = CalendarStorage(
             database_path=settings.database_path, encryption_key=encryption_key
@@ -138,6 +149,8 @@ async def main() -> None:
             contexts=contexts,
             knowledge=knowledge,
             films=films,
+            web=web,
+            pages=pages,
         )
 
         dispatcher = Dispatcher()

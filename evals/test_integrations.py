@@ -21,10 +21,13 @@ class GoldenLLM:
         timezone: str,
         context: str = "",
         knowledge: str = "",
+        web_results: str = "",
     ) -> AssistantDecision:
         assert text == self.scenario.prompt
         assert now == self.scenario.now
         assert timezone == self.scenario.timezone
+        if self.scenario.web_actions and not web_results:
+            return self.scenario.web_decision()
         return self.scenario.golden_decision()
 
 

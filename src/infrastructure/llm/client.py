@@ -73,12 +73,13 @@ class ChatLLMClient:
         timezone: str,
         context: str = "",
         knowledge: str = "",
+        web_results: str = "",
     ) -> AssistantDecision:
         instructions = decision_instructions(
-            now=now, timezone=timezone, knowledge=knowledge
+            now=now, timezone=timezone, knowledge=knowledge, web_results=web_results
         )
-        message = message_with_context(text, context, knowledge)
-        stage = "answer" if knowledge else "decision"
+        message = message_with_context(text, context, knowledge, web_results)
+        stage = "answer" if knowledge or web_results else "decision"
         # An empty actions array (memory eval, 2026-09-17), truncated JSON or a
         # schema slip each cost the user the whole reply. Asking once more is
         # far cheaper than answering nothing; the last failure still surfaces.

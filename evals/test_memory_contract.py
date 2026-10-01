@@ -48,6 +48,7 @@ class ScriptedLLM:
         timezone: str,
         context: str = "",
         knowledge: str = "",
+        web_results: str = "",
     ) -> AssistantDecision:
         if knowledge:
             facts = [fact["fact"] for fact in json.loads(knowledge)]

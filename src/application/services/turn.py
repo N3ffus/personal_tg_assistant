@@ -24,6 +24,7 @@ class Turn:
         llm: LLMClient,
         *,
         knowledge: str = "",
+        web_results: str = "",
         text: str | None = None,
         with_context: bool = True,
     ) -> AssistantDecision:
@@ -34,6 +35,7 @@ class Turn:
                 now=self.now,
                 timezone=self.timezone,
                 **({"knowledge": knowledge} if knowledge else {}),
+                **({"web_results": web_results} if web_results else {}),
                 **({"context": self.context} if self.context and with_context else {}),
             )
         finally:

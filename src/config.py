@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     # An external film directory catches invented titles in recommendations.
     # Without a key recommendations still work, just unverified.
     tmdb_api_key: SecretStr = SecretStr("")
+    brave_search_api_key: SecretStr = SecretStr("")
 
     # Knowledge memory is optional: the bot keeps working when Neo4j is down.
     knowledge_memory_enabled: bool = False

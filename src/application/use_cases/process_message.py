@@ -8,6 +8,7 @@ from time import perf_counter
 from src.application.ports.films import FilmDirectory
 from src.application.ports.knowledge import KnowledgeMemoryError
 from src.application.ports.llm import LLMClient
+from src.application.ports.web import WebPageReader, WebSearch
 from src.application.services.action_executor import (
     MEMORY_UNAVAILABLE,
     ActionExecutor,
@@ -21,6 +22,7 @@ from src.application.services.explicit_commands import (
 from src.application.services.film_recommendations import FilmRecommender
 from src.application.services.knowledge import KnowledgeService
 from src.application.services.turn import Turn
+from src.application.services.web_research import MAX_PAGES, WebResearch, links_in
 from src.domain.assistant.context import ContextMessage
 from src.domain.assistant.enums import ActionType
 from src.domain.assistant.models import (
@@ -29,8 +31,10 @@ from src.domain.assistant.models import (
     AssistantDecision,
     ChatAction,
     ForgetKnowledgeAction,
+    ReadWebPageAction,
     RecommendFilmsAction,
     SearchKnowledgeAction,
+    SearchWebAction,
 )
 from src.domain.assistant.replies import AssistantReply, ResultPage
 from src.domain.knowledge.models import KnowledgeFact
@@ -69,7 +73,7 @@ def _without_searches(decision: AssistantDecision) -> list[AssistantAction]:
     return [
         action
         for action in decision.actions
-        if not isinstance(action, SearchKnowledgeAction)
+        if not isinstance(action, (SearchKnowledgeAction, *WEB_ACTIONS))
     ]
 
 
@@ -82,6 +86,31 @@ ADMITS_IGNORANCE = re.compile(
     r"|(расскажи|напомни)(те)?\b",
     re.IGNORECASE,
 )
+# «в сети» alone is not a request: «я весь день был в сети». A search verb
+# must stand next to it.
+_SEARCH_VERB = r"(?:поищи|найди|посмотри|проверь|узнай|глянь|ищи)"
+_ONLINE = r"(?:в интернете|в инете|в сети|онлайн|в гугле|в яндексе)"
+EXPLICIT_WEB_REQUEST = re.compile(
+    rf"\b(?:по|за)гугли"
+    rf"|\b{_SEARCH_VERB}\b[^.!?\n]{{0,60}}?\b{_ONLINE}\b"
+    rf"|\b{_ONLINE}\s+{_SEARCH_VERB}\b",
+    re.IGNORECASE,
+)
+# A chat reply that declines to open a link. Only such a reply is overridden:
+# a clarifying question («Во сколько встреча?») or «Не могу создать встречу без
+# времени» about a message with a link must stay.
+REFUSES_WEB = re.compile(
+    r"(?:не\s+(?:могу|умею|имею|получится|вижу)|нет\s+доступа)[^.!?\n]{0,60}?"
+    r"(?:ссылк|сайт|страниц|интернет|онлайн|перейти|открыть|открыва|браузер"
+    r"|содержим)",
+    re.IGNORECASE,
+)
+WEB_ACTIONS = (SearchWebAction, ReadWebPageAction)
+WEB_ALREADY_READ = (
+    "(Интернет уже прочитан, всё найденное — в web_results. "
+    "Ответь на сообщение выше действием chat.)"
+)
+WEB_ANSWER_FAILED = "Не удалось составить ответ по найденным страницам."
 
 
 class ProcessMessageUseCase:
@@ -93,11 +122,14 @@ class ProcessMessageUseCase:
         contexts: ContextService | None = None,
         knowledge: KnowledgeService | None = None,
         films: FilmDirectory | None = None,
+        web: WebSearch | None = None,
+        pages: WebPageReader | None = None,
     ) -> None:
         self._llm = llm
         self._action_executor = action_executor
         self._contexts = contexts
         self._knowledge = knowledge
+        self._web = WebResearch(search=web, pages=pages)
         self._films = (
             FilmRecommender(llm=llm, knowledge=knowledge, films=films)
             if knowledge is not None
@@ -187,8 +219,25 @@ class ProcessMessageUseCase:
                 or parse_bulk_deletion(text)
                 or await turn.ask(self._llm)
             )
+            decision = self._web_when_requested(decision, text=text)
             decision = self._searched_before_admitting_ignorance(decision, text=text)
-            decision = await self._with_recalled_knowledge(decision, turn=turn)
+            if any(
+                isinstance(action, RecommendFilmsAction) for action in decision.actions
+            ):
+                # The catalogue filter owns film recommendations even when the
+                # model also went online; a web chat cannot bypass it.
+                decision = AssistantDecision(
+                    actions=[
+                        action
+                        for action in decision.actions
+                        if not isinstance(action, WEB_ACTIONS)
+                    ]
+                )
+                decision = await self._with_recalled_knowledge(decision, turn=turn)
+            elif any(isinstance(action, WEB_ACTIONS) for action in decision.actions):
+                decision = await self._with_web(decision, turn=turn)
+            else:
+                decision = await self._with_recalled_knowledge(decision, turn=turn)
             reply = await self._action_executor.execute_many(
                 decision.actions, user_id=user_id, now=now, message_id=message_id
             )
@@ -202,6 +251,108 @@ class ProcessMessageUseCase:
                 len(turn.llm_seconds),
                 sum(turn.llm_seconds) * 1000,
             )
+
+    async def _with_web(
+        self, decision: AssistantDecision, *, turn: Turn
+    ) -> AssistantDecision:
+        """Answer from bounded, untrusted internet material in one extra turn.
+
+        Only a chat comes back from the answer turn: a page that tells the
+        model to create a task must never reach the executor.
+        """
+        original: list[AssistantAction] = [
+            action
+            for action in decision.actions
+            if not isinstance(
+                action, (ChatAction, SearchKnowledgeAction, ForgetKnowledgeAction)
+            )
+            and not isinstance(action, WEB_ACTIONS)
+        ]
+        forgets = [
+            action
+            for action in decision.actions
+            if isinstance(action, ForgetKnowledgeAction)
+        ]
+        if forgets:
+            original.append(
+                await self._forgetting(forgets, turn=turn)
+                if self._knowledge is not None
+                else ChatAction(type=ActionType.CHAT, text=MEMORY_UNAVAILABLE)
+            )
+        material = await self._web.gather(decision.actions, turn=turn)
+        if isinstance(material, str):
+            return AssistantDecision(
+                actions=[*original, ChatAction(type=ActionType.CHAT, text=material)]
+            )
+        searches = [
+            action
+            for action in decision.actions
+            if isinstance(action, SearchKnowledgeAction)
+        ]
+        knowledge = ""
+        if searches and self._knowledge is not None:
+            knowledge, _ = await self._recall(searches, user_id=turn.user_id)
+        informed = await turn.ask(
+            self._llm, knowledge=knowledge, web_results=material.payload
+        )
+        answers = [
+            action for action in informed.actions if isinstance(action, ChatAction)
+        ]
+        if not answers:
+            logger.warning("llm.web_answer.repeated_search retry=1")
+            informed = await turn.ask(
+                self._llm,
+                knowledge=knowledge,
+                web_results=material.payload,
+                text=f"{turn.text}\n\n{WEB_ALREADY_READ}",
+            )
+            answers = [
+                action for action in informed.actions if isinstance(action, ChatAction)
+            ]
+        reply = answers[0].text if answers else WEB_ANSWER_FAILED
+        if material.sources:
+            listed = "\n".join(
+                f"{index}. {url}" for index, url in enumerate(material.sources, 1)
+            )
+            reply = f"{reply}\n\nИсточники:\n{listed}"
+        return AssistantDecision(
+            actions=[*original, ChatAction(type=ActionType.CHAT, text=reply)]
+        )
+
+    @staticmethod
+    def _web_when_requested(
+        decision: AssistantDecision, *, text: str
+    ) -> AssistantDecision:
+        """Use the internet when the user plainly asked and the model only chatted.
+
+        The model still answers «у меня нет доступа к интернету» now and then,
+        or retells a sent link from its guess of the page.
+        """
+        if not all(isinstance(action, ChatAction) for action in decision.actions):
+            return decision
+        if EXPLICIT_WEB_REQUEST.search(text):
+            logger.info("web.forced reason=explicit_request")
+            return AssistantDecision(
+                actions=[
+                    SearchWebAction(
+                        type=ActionType.SEARCH_WEB, query=text.strip()[:400]
+                    )
+                ]
+            )
+        links = links_in(text)
+        refused = any(
+            REFUSES_WEB.search(action.text)
+            for action in decision.actions
+            if isinstance(action, ChatAction)
+        )
+        if not links or not refused:
+            return decision
+        logger.info("web.forced reason=link_refused")
+        reads: list[AssistantAction] = [
+            ReadWebPageAction(type=ActionType.READ_WEB_PAGE, url=link)
+            for link in dict.fromkeys(links)
+        ]
+        return AssistantDecision(actions=reads[:MAX_PAGES])
 
     def _searched_before_admitting_ignorance(
         self, decision: AssistantDecision, *, text: str
