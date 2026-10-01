@@ -6,10 +6,8 @@ import httpx
 
 from src.application.ports.web import WebResult, WebSearchError
 
-SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+SEARCH_URL = "https://api.tavily.com/search"
 MAX_RESULTS = 5
-# Brave highlights query words with <strong> and escapes entities in titles and
-# descriptions; the model and the user need plain text.
 MARKUP = re.compile(r"<[^>]+>")
 
 
@@ -17,24 +15,29 @@ def _plain(value: object, limit: int) -> str:
     return html.unescape(MARKUP.sub("", str(value or ""))).strip()[:limit]
 
 
-class BraveWebSearch:
+class TavilyWebSearch:
     def __init__(
         self, *, api_key: str, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self._client = httpx.AsyncClient(
-            timeout=10,
-            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+            timeout=15,
+            headers={"Authorization": f"Bearer {api_key}"},
             transport=transport,
         )
 
     async def search(self, query: str) -> list[WebResult]:
         try:
-            response = await self._client.get(
-                SEARCH_URL, params={"q": query, "count": MAX_RESULTS}
+            response = await self._client.post(
+                SEARCH_URL,
+                json={
+                    "query": query,
+                    "max_results": MAX_RESULTS,
+                    "search_depth": "basic",
+                    "include_answer": False,
+                },
             )
             response.raise_for_status()
-            payload = response.json()
-            raw = payload.get("web", {}).get("results", [])
+            raw = response.json().get("results", [])
             if not isinstance(raw, list):
                 raise ValueError("invalid search results")
         except (httpx.HTTPError, ValueError, AttributeError, TypeError) as error:
@@ -58,8 +61,7 @@ class BraveWebSearch:
                 WebResult(
                     title=_plain(item.get("title"), 200),
                     url=url,
-                    snippet=_plain(item.get("description"), 600),
-                    age=_plain(item.get("age"), 40),
+                    snippet=_plain(item.get("content"), 600),
                 )
             )
         return results

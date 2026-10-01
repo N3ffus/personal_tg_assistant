@@ -32,7 +32,7 @@ MAX_RESULTS = 8
 MAX_PAGES = 2
 SOURCES_SHOWN = 3
 
-SEARCH_DISABLED = "Поиск в интернете не настроен: нужен BRAVE_SEARCH_API_KEY."
+SEARCH_DISABLED = "Поиск в интернете не настроен: нужен TAVILY_API_KEY."
 SEARCH_FAILED = "Поиск в интернете сейчас недоступен. Попробуй позже."
 NOTHING_FOUND = "По этому запросу ничего не нашлось в интернете."
 READING_DISABLED = "Чтение страниц по ссылке не настроено."

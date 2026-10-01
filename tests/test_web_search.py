@@ -33,13 +33,13 @@ from src.domain.assistant.models import (
     RecommendFilmsAction,
     SearchWebAction,
 )
-from src.infrastructure.web.brave import BraveWebSearch
 from src.infrastructure.web.pages import (
     MAX_TEXT_CHARS,
     HttpWebPageReader,
     html_to_text,
     is_public,
 )
+from src.infrastructure.web.tavily import TavilyWebSearch
 
 NOW = datetime(2026, 9, 26, tzinfo=UTC)
 PUBLIC_IP = "93.184.216.34"
@@ -88,35 +88,32 @@ def _replied(executor: SimpleNamespace) -> str:
 
 
 @pytest.mark.asyncio
-async def test_brave_search_returns_bounded_valid_web_results() -> None:
+async def test_tavily_search_returns_bounded_valid_web_results() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["X-Subscription-Token"] == "test-key"
-        assert request.url.params["q"] == "актуальная версия Python"
+        assert request.method == "POST"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert json.loads(request.content)["query"] == "актуальная версия Python"
         return httpx.Response(
             200,
             json={
-                "web": {
-                    "results": [
-                        {
-                            "title": "Python &amp; релизы",
-                            "url": "https://python.example/releases",
-                            "description": "<strong>Последний</strong> выпуск",
-                            "age": "2 days ago",
-                        },
-                        {"title": "bad", "url": "javascript:alert(1)"},
-                    ]
-                }
+                "results": [
+                    {
+                        "title": "Python &amp; релизы",
+                        "url": "https://python.example/releases",
+                        "content": "<strong>Последний</strong> выпуск",
+                    },
+                    {"title": "bad", "url": "javascript:alert(1)"},
+                ]
             },
         )
 
-    web = BraveWebSearch(api_key="test-key", transport=httpx.MockTransport(handler))
+    web = TavilyWebSearch(api_key="test-key", transport=httpx.MockTransport(handler))
     try:
         assert await web.search("актуальная версия Python") == [
             WebResult(
                 title="Python & релизы",
                 url="https://python.example/releases",
                 snippet="Последний выпуск",
-                age="2 days ago",
             )
         ]
     finally:
@@ -124,8 +121,8 @@ async def test_brave_search_returns_bounded_valid_web_results() -> None:
 
 
 @pytest.mark.asyncio
-async def test_brave_search_reports_api_failure() -> None:
-    web = BraveWebSearch(
+async def test_tavily_search_reports_api_failure() -> None:
+    web = TavilyWebSearch(
         api_key="test-key",
         transport=httpx.MockTransport(lambda _: httpx.Response(429)),
     )
